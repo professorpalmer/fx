@@ -1427,9 +1427,11 @@ fn projectTieredTurn(
     }
 
     const bytes = try out.toOwnedSlice();
-    errdefer alloc.free(bytes);
-    const owned_lines = try lines.toOwnedSlice(alloc);
-    errdefer alloc.free(owned_lines);
+    const owned_lines = lines.toOwnedSlice(alloc) catch |err| {
+        alloc.free(bytes);
+        return err;
+    };
+    // setOwnedGroup takes ownership; on failure it frees bytes/lines itself.
     try projection.setOwnedGroup(alloc, tool_indices.items[0], .{ .bytes = bytes, .lines = owned_lines });
 }
 
