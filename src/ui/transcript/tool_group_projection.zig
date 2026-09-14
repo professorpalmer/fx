@@ -1181,8 +1181,12 @@ fn projectLegacyGroupsInSpan(
                 var gap = prev + 1;
                 var split = false;
                 while (gap < idx) : (gap += 1) {
-                    if (toolStatusEntryId(entries[gap]) != null) continue;
                     if (isAttachedEntry(entries[gap])) continue;
+                    // Ask rows and other tool statuses between members are hard splits.
+                    if (toolStatusEntryId(entries[gap]) != null) {
+                        split = true;
+                        break;
+                    }
                     if (!isTransparentCompactEntry(entries[gap])) {
                         split = true;
                         break;
@@ -1414,9 +1418,18 @@ fn projectTieredTurn(
     for (prose_indices.items) |prose_index| {
         projection.entry_actions.items[prose_index] = .hide;
     }
+    // Compact: hide orphaned attachments left behind after prose relocation.
+    var span_index = span_start;
+    while (span_index < span_end) : (span_index += 1) {
+        if (isAttachedEntry(entries[span_index])) {
+            projection.entry_actions.items[span_index] = .hide;
+        }
+    }
 
     const bytes = try out.toOwnedSlice();
+    errdefer alloc.free(bytes);
     const owned_lines = try lines.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_lines);
     try projection.setOwnedGroup(alloc, tool_indices.items[0], .{ .bytes = bytes, .lines = owned_lines });
 }
 
