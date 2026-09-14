@@ -4316,6 +4316,9 @@ pub const TranscriptRuntime = struct {
     collapse_tool_calls: bool = false,
     /// Marionette-style per-node expand/collapse (T0 turn / T1 groups).
     tool_collapse: tool_collapse_state.ToolCollapseTree = .{},
+    /// Preferred-turn T0 (+ compact T1 headers) painted sticky at the top of the
+    /// compact transcript viewport. Owned; refreshed each preparation.
+    sticky_umbrella_chrome: ?[]u8 = null,
     /// Structured-entry store used to regenerate transcript bytes at the
     /// current width while retaining the raw byte buffer for append paths
     /// that still write pre-rendered transcript content.
@@ -4433,6 +4436,10 @@ pub const TranscriptRuntime = struct {
         self.full_transcript_page_load.deinit();
         self.discardInstalledFullTranscriptPage();
         self.compact_transcript_source_cache.deinit(alloc);
+        if (self.sticky_umbrella_chrome) |bytes| {
+            alloc.free(bytes);
+            self.sticky_umbrella_chrome = null;
+        }
         self.tool_collapse.deinit(alloc);
         self.lifecycle_state.deinit(alloc);
         for (self.tool_details.items) |*detail| detail.deinit(alloc);
@@ -5735,6 +5742,9 @@ pub const TranscriptRuntime = struct {
         entry_id: u32,
         pending: *PendingToolDetailStart,
     ) void {
+        if (pending.lifecycle_id) |id| {
+            self.tool_collapse.ensurePreferredTurn(tool_collapse_state.turnKeyFromLifecycle(id.turn_id));
+        }
         const search = self.toolDetailSearch(entry_id);
         if (search.found) {
             const detail = &self.tool_details.items[search.index];

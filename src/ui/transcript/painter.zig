@@ -1128,6 +1128,10 @@ pub const PreparedTranscriptSurfacePaint = struct {
     // producer facts. Empty candidates mean the whole flow is final.
     finality_candidates: transcript_release.Candidates = .{},
     cursor: ViewportCursorResult = .{ .cursor_row = 1, .cursor_col = 1, .replaceable_row = 1 },
+    /// Borrowed sticky umbrella chrome (not owned); painted at sticky_top_row.
+    sticky_chrome: []const u8 = &.{},
+    sticky_rows: u16 = 0,
+    sticky_top_row: u16 = 0,
 
     pub fn deinit(self: *PreparedTranscriptSurfacePaint, alloc: Allocator) void {
         self.finality_candidates.deinit(alloc);
@@ -1812,6 +1816,29 @@ fn prepareTranscriptSurfacePaintInternal(
         transcript_line_count;
     var visible_rows: u16 = bottom_row - top_row + 1;
 
+    // Sticky T0 (+ compact T1 headers) inset: reserve top rows so the live
+    // umbrella stays visible while the main transcript scrolls underneath.
+    if (comptime @hasField(@TypeOf(self.*), "sticky_umbrella_chrome")) {
+        if (self.sticky_umbrella_chrome) |chrome| {
+            if (chrome.len > 0 and visible_rows > 1) {
+                var rows: u16 = 1;
+                for (chrome) |byte| {
+                    if (byte == '\n') rows += 1;
+                }
+                // Cap sticky so at least one scrolling row remains.
+                if (rows >= visible_rows) rows = visible_rows - 1;
+                if (rows > 0) {
+                    prepared.sticky_chrome = chrome;
+                    prepared.sticky_rows = rows;
+                    prepared.sticky_top_row = top_row;
+                    top_row += rows;
+                    visible_rows -= rows;
+                    prepared.projection_area.top = top_row;
+                }
+            }
+        }
+    }
+
     const capture_line_provenance = source.line_provenance.len > 0;
     var repl_line_idx: usize = total_lines;
     var tracked_visible_line: ?usize = null;
@@ -2038,6 +2065,37 @@ fn prepareTranscriptSurfacePaintInternal(
                                 committed.start_line,
                                 committed.partial_skip_rows,
                             },
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // Collapse hotkeys must not snap the viewport to the composer/tail. When the
+    // tree asks to preserve scroll, pin the prior visual offset across the
+    // incompatible flow rewrite that tiered projection produces.
+    if (comptime @hasField(@TypeOf(self.*), "tool_collapse")) {
+        if (self.tool_collapse.takePreserveViewport()) {
+            if (comptime @hasDecl(@TypeOf(self.*), "stableTranscriptProjectionForFlow")) {
+                if (self.stableTranscriptProjectionForFlow(transcript_bytes)) |stable| {
+                    const max_offset = prepared.sourceTotalVisualRows();
+                    const preserved = @min(stable.history_visual_offset, max_offset);
+                    if (preserved > 0 or stable.history_visual_offset > 0) {
+                        setSelectionVisualOffset(
+                            &viewport_selection_snapshot,
+                            prepared.sourceVisualRows(),
+                            preserved,
+                        );
+                        rows_budget = unusedRowsForSelection(
+                            prepared.sourceVisualRows(),
+                            viewport_selection_snapshot,
+                            visible_rows,
+                        );
+                        welcome_decision = .none;
+                        debug_trace.logf(
+                            "scroll",
+                            "collapse_preserve_viewport offset={d} total={d}",
+                            .{ preserved, max_offset },
                         );
                     }
                 }
@@ -3289,6 +3347,15 @@ pub fn paintPreparedTranscriptIntoSurface(
     surface: *frame_surface.FrameSurface,
     prepared: *const PreparedTranscriptSurfacePaint,
 ) !paint_plan.TranscriptPaintResult {
+    if (prepared.sticky_rows > 0 and prepared.sticky_chrome.len > 0) {
+        _ = try surface.writeAnsiBand(
+            prepared.sticky_top_row,
+            prepared.sticky_rows,
+            prepared.sticky_chrome,
+            .transcript,
+            .same_owner,
+        );
+    }
     const render_context = .{
         .layout = self.layout,
         .replaceable_last_line = prepared.replaceable_last_line,
