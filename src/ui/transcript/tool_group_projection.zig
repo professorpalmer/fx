@@ -1287,9 +1287,18 @@ fn projectTieredTurn(
     if (tool_indices.items.len == 0) return;
 
     const turn_key = turnKeyForSpan(entries, details, detail_indices, span_start, span_end);
-    // Umbrella is required when protected prose is interleaved (Marionette region
-    // split) or when a live per-node tree is present for mid-run hotkeys.
-    const use_umbrella = prose_indices.items.len > 0 or collapse.tree != null;
+    // Umbrella when protected prose is interleaved (Marionette relocate), or when
+    // this span is the live/preferred hotkey turn. A non-null tree alone must NOT
+    // force umbrella on every historical turn — that rewrote scrollback and could
+    // double-paint relocated prose against retained rows.
+    const live_turn = blk: {
+        if (collapse.active_turn_key) |active| break :blk active == turn_key;
+        if (collapse.tree) |tree| {
+            if (tree.preferred_turn_key) |preferred| break :blk preferred == turn_key;
+        }
+        break :blk false;
+    };
+    const use_umbrella = prose_indices.items.len > 0 or live_turn;
     if (!use_umbrella) {
         try projectLegacyGroupsInSpan(
             alloc,
@@ -2489,6 +2498,67 @@ test "umbrella prose join trims stacked newlines" {
     const block = projection.entry_actions.items[0].override.bytes;
     try std.testing.expect(std.mem.find(u8, block, "first paragraph\n\nsecond paragraph") != null);
     try std.testing.expect(std.mem.find(u8, block, "first paragraph\n\n\n\nsecond") == null);
+}
+
+test "relocated prose appears only once under umbrella" {
+    const alloc = std.testing.allocator;
+    var entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "command", .class = .tool_status } },
+        .{ .assistant_turn = .{ .id = 2, .segments = .{} } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "read", .class = .tool_status } },
+        .{ .assistant_turn = .{ .id = 4, .segments = .{} } },
+    };
+    try entries[1].assistant_turn.segments.text.appendSlice(alloc, "UNIQUE_PROSE_ALPHA");
+    try entries[3].assistant_turn.segments.text.appendSlice(alloc, "UNIQUE_PROSE_BETA");
+    defer entries[1].assistant_turn.segments.deinit(alloc);
+    defer entries[3].assistant_turn.segments.deinit(alloc);
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
+        .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    try std.testing.expect(projection.entry_actions.items[1] == .hide);
+    try std.testing.expect(projection.entry_actions.items[2] == .hide);
+    try std.testing.expect(projection.entry_actions.items[3] == .hide);
+
+    const block = projection.entry_actions.items[0].override.bytes;
+    const countPhrase = struct {
+        fn count(hay: []const u8, needle: []const u8) usize {
+            var n: usize = 0;
+            var start: usize = 0;
+            while (std.mem.indexOfPos(u8, hay, start, needle)) |at| {
+                n += 1;
+                start = at + needle.len;
+            }
+            return n;
+        }
+    }.count;
+    try std.testing.expectEqual(@as(usize, 1), countPhrase(block, "UNIQUE_PROSE_ALPHA"));
+    try std.testing.expectEqual(@as(usize, 1), countPhrase(block, "UNIQUE_PROSE_BETA"));
+}
+
+test "historical tool-only turn without live key stays legacy grouped" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "command", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "read", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+    };
+    var tree: tool_collapse_state.ToolCollapseTree = .{};
+    defer tree.deinit(alloc);
+    // Tree present but no preferred/active turn — must not force umbrella.
+    const collapse: CollapseView = .{ .tree = &tree, .collapse_tool_calls = true };
+    var projection = try buildStyledFocused(alloc, &entries, &details, 120, null, collapse, .{}, .{});
+    defer projection.deinit(alloc);
+    const block = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, block, "Tool activity") == null);
 }
 
 test "umbrella prose separator keeps line provenance aligned" {
