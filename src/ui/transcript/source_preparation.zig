@@ -1138,7 +1138,7 @@ fn buildCompactTranscriptProjectionInterruptible(
         self.tool_details.items,
         self.layout.cols,
         focused_entry_id,
-        collapseToolCalls(self),
+        collapseView(self),
         .{
             .marker_style = user_message_card.promptMarkerStyle(),
             .text_style = ui_render.statusline_style,
@@ -1250,6 +1250,20 @@ fn buildCommandOutputOverridesInterruptible(
         }
     }
     return overrides;
+}
+
+fn collapseView(self: anytype) tool_group_projection.CollapseView {
+    const Shell = @TypeOf(self.*);
+    var view: tool_group_projection.CollapseView = .{
+        .collapse_tool_calls = collapseToolCalls(self),
+    };
+    if (comptime @hasField(Shell, "tool_collapse")) {
+        view.tree = &self.tool_collapse;
+        if (self.tool_collapse.preferred_turn_key) |turn_key| {
+            view.active_turn_key = turn_key;
+        }
+    }
+    return view;
 }
 
 fn collapseToolCalls(self: anytype) bool {

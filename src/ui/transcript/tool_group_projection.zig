@@ -5,10 +5,35 @@ const types = @import("../../core/shared/types.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
 const ui_render = @import("../render.zig");
+const tool_collapse_state = @import("tool_collapse_state.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
 const cancellation_follow_up = " · What can fx do differently?";
+
+/// Compact-view collapse policy for Marionette-style T0/T1 projection.
+pub const CollapseView = struct {
+    collapse_tool_calls: bool = false,
+    tree: ?*const tool_collapse_state.ToolCollapseTree = null,
+    active_turn_key: ?u64 = null,
+    active_turn_elapsed_seconds: ?i64 = null,
+
+    fn defaults(self: CollapseView) tool_collapse_state.CollapseDefaults {
+        return tool_collapse_state.CollapseDefaults.fromCollapseToolCalls(self.collapse_tool_calls);
+    }
+
+    fn turnExpanded(self: CollapseView, turn_key: u64) bool {
+        const defs = self.defaults();
+        if (self.tree) |tree| return tree.turnIsExpanded(turn_key, defs);
+        return defs.turn_expanded;
+    }
+
+    fn groupExpanded(self: CollapseView, group_key: u64) bool {
+        const defs = self.defaults();
+        if (self.tree) |tree| return tree.groupIsExpanded(group_key, defs);
+        return defs.group_expanded;
+    }
+};
 
 pub const Projection = struct {
     entry_actions: std.ArrayList(transcript_blocks.EntryRenderAction) = .empty,
@@ -790,7 +815,7 @@ fn build(
     details: []const ToolDetailRecord,
     cols: u16,
 ) !Projection {
-    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, .{}, .{}, .compact, null, null) catch |err| switch (err) {
+    return buildWithStyleAndStats(alloc, entries, details, cols, null, .{}, .{}, .{}, .compact, null, null) catch |err| switch (err) {
         error.InputPending => unreachable,
         else => |other| return other,
     };
@@ -804,7 +829,7 @@ pub fn buildStyled(
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
 ) !Projection {
-    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, style, styles, .compact, null, null) catch |err| switch (err) {
+    return buildWithStyleAndStats(alloc, entries, details, cols, null, .{}, style, styles, .compact, null, null) catch |err| switch (err) {
         error.InputPending => unreachable,
         else => |other| return other,
     };
@@ -819,7 +844,7 @@ pub fn buildExpandedStyledInterruptible(
     styles: transcript_blocks.Styles,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !Projection {
-    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, style, styles, .expanded, null, checkpoint);
+    return buildWithStyleAndStats(alloc, entries, details, cols, null, .{}, style, styles, .expanded, null, checkpoint);
 }
 
 pub fn buildExpandedRelationshipsInterruptible(
@@ -834,7 +859,7 @@ pub fn buildExpandedRelationshipsInterruptible(
         details,
         std.math.maxInt(u16),
         null,
-        false,
+        .{},
         .{},
         .{},
         .expanded,
@@ -909,7 +934,7 @@ pub fn buildStyledFocused(
     details: []const ToolDetailRecord,
     cols: u16,
     focused_entry_id: ?u32,
-    collapse_tool_calls: bool,
+    collapse: CollapseView,
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
 ) !Projection {
@@ -919,7 +944,7 @@ pub fn buildStyledFocused(
         details,
         cols,
         focused_entry_id,
-        collapse_tool_calls,
+        collapse,
         style,
         styles,
         null,
@@ -935,7 +960,7 @@ pub fn buildStyledFocusedInterruptible(
     details: []const ToolDetailRecord,
     cols: u16,
     focused_entry_id: ?u32,
-    collapse_tool_calls: bool,
+    collapse: CollapseView,
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
@@ -946,7 +971,7 @@ pub fn buildStyledFocusedInterruptible(
         details,
         cols,
         focused_entry_id,
-        collapse_tool_calls,
+        collapse,
         style,
         styles,
         .compact,
@@ -962,7 +987,480 @@ fn buildWithStats(
     cols: u16,
     stats: ?*BuildStats,
 ) !Projection {
-    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, .{}, .{}, .compact, stats, null);
+    return buildWithStyleAndStats(alloc, entries, details, cols, null, .{}, .{}, .{}, .compact, stats, null);
+}
+
+const TieredGroup = struct {
+    group_key: u64,
+    status_indices: std.ArrayList(usize) = .empty,
+    summary: Summary = .{},
+
+    fn deinit(self: *TieredGroup, alloc: std.mem.Allocator) void {
+        self.status_indices.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn isProtectedProseEntry(entry: TranscriptEntry) bool {
+    return switch (entry) {
+        .assistant_turn => |assistant| assistant.segments.text.items.len > 0,
+        else => false,
+    };
+}
+
+fn turnKeyForSpan(
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+    detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
+    span_start: usize,
+    span_end: usize,
+) u64 {
+    var index = span_start;
+    while (index < span_end) : (index += 1) {
+        const entry_id = toolStatusEntryId(entries[index]) orelse continue;
+        const detail = detailForEntry(details, detail_indices, entry_id, null) orelse continue;
+        if (detail.lifecycle_id) |lifecycle| {
+            return tool_collapse_state.turnKeyFromLifecycle(lifecycle.turn_id);
+        }
+        if (detail.presentation_group_id) |group| {
+            return tool_collapse_state.turnKeyFromLifecycle(group.turn_id);
+        }
+    }
+    const start_id = if (span_start < entries.len) entries[span_start].id() else 0;
+    return tool_collapse_state.turnKeySynthetic(start_id);
+}
+
+fn formatElapsedSeconds(alloc: std.mem.Allocator, seconds: i64) ![]u8 {
+    const secs = @mod(seconds, 60);
+    const total_minutes = @divTrunc(seconds, 60);
+    const mins = @mod(total_minutes, 60);
+    const hours = @divTrunc(total_minutes, 60);
+    if (hours > 0) return try std.fmt.allocPrint(alloc, "{d}h{d}m{d}s", .{ hours, mins, secs });
+    if (mins > 0) return try std.fmt.allocPrint(alloc, "{d}m{d}s", .{ mins, secs });
+    return try std.fmt.allocPrint(alloc, "{d}s", .{secs});
+}
+
+fn formatTurnUmbrellaHeader(
+    alloc: std.mem.Allocator,
+    total_tools: usize,
+    cols: u16,
+    style: SummaryStyle,
+    collapse: CollapseView,
+    turn_key: u64,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const expanded = collapse.turnExpanded(turn_key);
+    try out.writer.writeAll(if (expanded) "▼ " else "▶ ");
+    var used_elapsed = false;
+    if (collapse.active_turn_key == turn_key) {
+        if (collapse.active_turn_elapsed_seconds) |seconds| {
+            if (seconds >= 0) {
+                const elapsed = try formatElapsedSeconds(alloc, seconds);
+                defer alloc.free(elapsed);
+                try out.writer.print("Worked for {s}", .{elapsed});
+                used_elapsed = true;
+            }
+        }
+    }
+    if (!used_elapsed) try out.writer.writeAll("Tool activity");
+    if (total_tools > 0) {
+        try out.writer.print(" · {d} tool call{s}", .{
+            total_tools,
+            if (total_tools == 1) "" else "s",
+        });
+    }
+    const plain = try out.toOwnedSlice();
+    defer alloc.free(plain);
+    const clipped = try clipSummary(alloc, plain, cols);
+    defer alloc.free(clipped);
+    return applySummaryStyle(alloc, clipped, style);
+}
+
+fn indentBlockLines(alloc: std.mem.Allocator, block: []const u8, indent: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    var lines = std.mem.splitScalar(u8, block, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try out.writer.writeByte('\n');
+        first = false;
+        try out.writer.writeAll(indent);
+        try out.writer.writeAll(line);
+    }
+    return out.toOwnedSlice();
+}
+
+fn appendProtectedProse(
+    _: std.mem.Allocator,
+    out: *std.Io.Writer.Allocating,
+    entries: []const TranscriptEntry,
+    prose_indices: []const usize,
+) !void {
+    var wrote_any = false;
+    for (prose_indices) |index| {
+        const text = switch (entries[index]) {
+            .assistant_turn => |assistant| assistant.segments.text.items,
+            else => continue,
+        };
+        if (text.len == 0) continue;
+        if (wrote_any) try out.writer.writeByte('\n');
+        try out.writer.writeAll(text);
+        wrote_any = true;
+    }
+}
+
+fn projectLegacyGroupsInSpan(
+    alloc: std.mem.Allocator,
+    projection: *Projection,
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+    detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
+    presentation_group_indices: []const ?usize,
+    presentation_groups: []PresentationGroup,
+    tool_indices: []const usize,
+    focused_entry_id: ?u32,
+    collapse: CollapseView,
+    cols: u16,
+    style: SummaryStyle,
+    styles: transcript_blocks.Styles,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !void {
+    var seen_presentation: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer seen_presentation.deinit(alloc);
+
+    for (tool_indices) |tool_index| {
+        try build_checkpoint.tick(checkpoint);
+        const group_index = presentation_group_indices[tool_index] orelse continue;
+        const result = try seen_presentation.getOrPut(alloc, group_index);
+        if (result.found_existing) continue;
+        const group = presentation_groups[group_index];
+        for (group.status_indices.items) |status_index| {
+            projection.entry_actions.items[status_index] = .hide;
+            hideAttachedRows(entries, projection.entry_actions.items, status_index);
+        }
+        const entry_id = toolStatusEntryId(entries[group.anchor_index]) orelse continue;
+        const group_key = blk: {
+            const detail = detailForEntry(details, detail_indices, entry_id, null);
+            if (presentationGroupId(detail)) |gid|
+                break :blk tool_collapse_state.groupKeyForPresentation(gid);
+            break :blk tool_collapse_state.groupKeyForSequentialAnchor(entry_id);
+        };
+        const block = try formatGroupBlock(
+            alloc,
+            entries,
+            group.status_indices.items,
+            details,
+            detail_indices,
+            group.summary,
+            focused_entry_id,
+            !collapse.groupExpanded(group_key),
+            cols,
+            style,
+            styles,
+        );
+        try projection.setOwnedGroup(alloc, group.anchor_index, block);
+    }
+
+    var i: usize = 0;
+    while (i < tool_indices.len) : (i += 1) {
+        try build_checkpoint.tick(checkpoint);
+        const tool_index = tool_indices[i];
+        if (presentation_group_indices[tool_index] != null) continue;
+        if (projection.entry_actions.items[tool_index] == .override) continue;
+
+        var status_indices: std.ArrayList(usize) = .empty;
+        defer status_indices.deinit(alloc);
+        var summary: Summary = .{};
+        var j = i;
+        while (j < tool_indices.len) : (j += 1) {
+            const idx = tool_indices[j];
+            if (presentation_group_indices[idx] != null) break;
+            if (j > i) {
+                const prev = tool_indices[j - 1];
+                var gap = prev + 1;
+                var split = false;
+                while (gap < idx) : (gap += 1) {
+                    if (toolStatusEntryId(entries[gap]) != null) continue;
+                    if (isAttachedEntry(entries[gap])) continue;
+                    if (!isTransparentCompactEntry(entries[gap])) {
+                        split = true;
+                        break;
+                    }
+                }
+                if (split) break;
+            }
+            const entry_id = toolStatusEntryId(entries[idx]).?;
+            const detail = detailForEntry(details, detail_indices, entry_id, null);
+            if (statusNamesAsk(entries[idx], detail)) break;
+            observeTool(&summary, detail);
+            try status_indices.append(alloc, idx);
+        }
+        if (status_indices.items.len == 0) continue;
+        const first_index = status_indices.items[0];
+        for (status_indices.items) |status_index| {
+            projection.entry_actions.items[status_index] = .hide;
+            hideAttachedRows(entries, projection.entry_actions.items, status_index);
+        }
+        const group_key = tool_collapse_state.groupKeyForSequentialAnchor(
+            toolStatusEntryId(entries[first_index]).?,
+        );
+        const block = try formatGroupBlock(
+            alloc,
+            entries,
+            status_indices.items,
+            details,
+            detail_indices,
+            summary,
+            focused_entry_id,
+            !collapse.groupExpanded(group_key),
+            cols,
+            style,
+            styles,
+        );
+        try projection.setOwnedGroup(alloc, first_index, block);
+        i = j - 1;
+    }
+}
+
+fn projectTieredTurn(
+    alloc: std.mem.Allocator,
+    projection: *Projection,
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+    detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
+    presentation_group_indices: []const ?usize,
+    presentation_groups: []PresentationGroup,
+    span_start: usize,
+    span_end: usize,
+    focused_entry_id: ?u32,
+    collapse: CollapseView,
+    cols: u16,
+    style: SummaryStyle,
+    styles: transcript_blocks.Styles,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !void {
+    var tool_indices: std.ArrayList(usize) = .empty;
+    defer tool_indices.deinit(alloc);
+    var prose_indices: std.ArrayList(usize) = .empty;
+    defer prose_indices.deinit(alloc);
+
+    var index = span_start;
+    while (index < span_end) : (index += 1) {
+        try build_checkpoint.tick(checkpoint);
+        const entry = entries[index];
+        if (!transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
+        if (toolStatusEntryId(entry)) |entry_id| {
+            const detail = detailForEntry(details, detail_indices, entry_id, null);
+            if (statusNamesAsk(entry, detail)) continue;
+            try tool_indices.append(alloc, index);
+            continue;
+        }
+        if (isProtectedProseEntry(entry)) try prose_indices.append(alloc, index);
+    }
+    if (tool_indices.items.len == 0) return;
+
+    const turn_key = turnKeyForSpan(entries, details, detail_indices, span_start, span_end);
+    // Umbrella is required when protected prose is interleaved (Marionette region
+    // split) or when a live per-node tree is present for mid-run hotkeys.
+    const use_umbrella = prose_indices.items.len > 0 or collapse.tree != null;
+    if (!use_umbrella) {
+        try projectLegacyGroupsInSpan(
+            alloc,
+            projection,
+            entries,
+            details,
+            detail_indices,
+            presentation_group_indices,
+            presentation_groups,
+            tool_indices.items,
+            focused_entry_id,
+            collapse,
+            cols,
+            style,
+            styles,
+            checkpoint,
+        );
+        return;
+    }
+
+    const t0_expanded = collapse.turnExpanded(turn_key);
+    var tiered_groups: std.ArrayList(TieredGroup) = .empty;
+    defer {
+        for (tiered_groups.items) |*group| group.deinit(alloc);
+        tiered_groups.deinit(alloc);
+    }
+    var seen_presentation: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer seen_presentation.deinit(alloc);
+
+    for (tool_indices.items) |tool_index| {
+        const group_index = presentation_group_indices[tool_index] orelse continue;
+        const result = try seen_presentation.getOrPut(alloc, group_index);
+        if (result.found_existing) continue;
+        const source = presentation_groups[group_index];
+        var group: TieredGroup = .{
+            .group_key = blk: {
+                const entry_id = toolStatusEntryId(entries[tool_index]).?;
+                const detail = detailForEntry(details, detail_indices, entry_id, null);
+                if (presentationGroupId(detail)) |gid|
+                    break :blk tool_collapse_state.groupKeyForPresentation(gid);
+                break :blk tool_collapse_state.groupKeyForSequentialAnchor(entry_id);
+            },
+            .summary = source.summary,
+        };
+        errdefer group.deinit(alloc);
+        for (source.status_indices.items) |status_index| {
+            if (status_index < span_start or status_index >= span_end) continue;
+            try group.status_indices.append(alloc, status_index);
+        }
+        if (group.status_indices.items.len == 0) {
+            group.deinit(alloc);
+            continue;
+        }
+        try tiered_groups.append(alloc, group);
+    }
+
+    var sequential: TieredGroup = .{
+        .group_key = tool_collapse_state.groupKeyForSequentialAnchor(
+            toolStatusEntryId(entries[tool_indices.items[0]]).?,
+        ),
+    };
+    var sequential_owned = true;
+    errdefer if (sequential_owned) sequential.deinit(alloc);
+    for (tool_indices.items) |tool_index| {
+        if (presentation_group_indices[tool_index] != null) continue;
+        const entry_id = toolStatusEntryId(entries[tool_index]).?;
+        const detail = detailForEntry(details, detail_indices, entry_id, null);
+        observeTool(&sequential.summary, detail);
+        try sequential.status_indices.append(alloc, tool_index);
+    }
+    if (sequential.status_indices.items.len > 0) {
+        sequential.group_key = tool_collapse_state.groupKeyForSequentialAnchor(
+            toolStatusEntryId(entries[sequential.status_indices.items[0]]).?,
+        );
+        try tiered_groups.append(alloc, sequential);
+        sequential_owned = false;
+    } else {
+        sequential.deinit(alloc);
+        sequential_owned = false;
+    }
+
+    var total_tools: usize = 0;
+    for (tiered_groups.items) |group| total_tools += group.summary.total;
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    var lines: std.ArrayList(transcript_blocks.LineProvenance) = .empty;
+    errdefer lines.deinit(alloc);
+
+    const header = try formatTurnUmbrellaHeader(alloc, total_tools, cols, style, collapse, turn_key);
+    defer alloc.free(header);
+    try out.writer.writeAll(header);
+    const anchor_entry_id = toolStatusEntryId(entries[tool_indices.items[0]]).?;
+    try lines.append(alloc, .{ .entry = .{
+        .entry_id = anchor_entry_id,
+        .entry_class = .tool_status,
+        .projection_part = .group_header,
+    } });
+
+    if (t0_expanded) {
+        for (tiered_groups.items) |group| {
+            try build_checkpoint.tick(checkpoint);
+            const block = try formatGroupBlock(
+                alloc,
+                entries,
+                group.status_indices.items,
+                details,
+                detail_indices,
+                group.summary,
+                focused_entry_id,
+                !collapse.groupExpanded(group.group_key),
+                cols,
+                style,
+                styles,
+            );
+            defer {
+                alloc.free(block.bytes);
+                alloc.free(block.lines);
+            }
+            const indented = try indentBlockLines(alloc, block.bytes, "  ");
+            defer alloc.free(indented);
+            try out.writer.writeByte('\n');
+            try out.writer.writeAll(indented);
+            try lines.appendSlice(alloc, block.lines);
+        }
+    }
+
+    if (prose_indices.items.len > 0) {
+        try out.writer.writeAll("\n\n");
+        const prose_start = out.writer.end;
+        try appendProtectedProse(alloc, &out, entries, prose_indices.items);
+        if (out.writer.end > prose_start) {
+            const prose_entry_id = entries[prose_indices.items[0]].id();
+            const prose_bytes = out.writer.buffer[prose_start..out.writer.end];
+            const prose_line_count = std.mem.count(u8, std.mem.trimEnd(u8, prose_bytes, "\n"), "\n") + 1;
+            try lines.appendNTimes(alloc, .{ .entry = .{
+                .entry_id = prose_entry_id,
+                .entry_class = .assistant_turn,
+                .projection_part = .body,
+            } }, prose_line_count);
+        }
+    }
+
+    for (tool_indices.items) |tool_index| {
+        projection.entry_actions.items[tool_index] = .hide;
+        hideAttachedRows(entries, projection.entry_actions.items, tool_index);
+    }
+    for (prose_indices.items) |prose_index| {
+        projection.entry_actions.items[prose_index] = .hide;
+    }
+
+    const bytes = try out.toOwnedSlice();
+    const owned_lines = try lines.toOwnedSlice(alloc);
+    try projection.setOwnedGroup(alloc, tool_indices.items[0], .{ .bytes = bytes, .lines = owned_lines });
+}
+
+fn projectCompactTieredTurns(
+    alloc: std.mem.Allocator,
+    projection: *Projection,
+    entries: []const TranscriptEntry,
+    details: []const ToolDetailRecord,
+    detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
+    presentation_group_indices: []const ?usize,
+    presentation_groups: []PresentationGroup,
+    focused_entry_id: ?u32,
+    collapse: CollapseView,
+    cols: u16,
+    style: SummaryStyle,
+    styles: transcript_blocks.Styles,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !void {
+    var span_start: usize = 0;
+    var index: usize = 0;
+    while (index <= entries.len) : (index += 1) {
+        const at_boundary = index == entries.len or entries[index] == .user_turn;
+        if (!at_boundary) continue;
+        if (index > span_start) {
+            try projectTieredTurn(
+                alloc,
+                projection,
+                entries,
+                details,
+                detail_indices,
+                presentation_group_indices,
+                presentation_groups,
+                span_start,
+                index,
+                focused_entry_id,
+                collapse,
+                cols,
+                style,
+                styles,
+                checkpoint,
+            );
+        }
+        span_start = index + 1;
+    }
 }
 
 fn buildWithStyleAndStats(
@@ -971,7 +1469,7 @@ fn buildWithStyleAndStats(
     details: []const ToolDetailRecord,
     cols: u16,
     focused_entry_id: ?u32,
-    collapse_tool_calls: bool,
+    collapse: CollapseView,
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
     mode: ProjectionMode,
@@ -1110,97 +1608,21 @@ fn buildWithStyleAndStats(
         return projection;
     }
 
-    var index: usize = 0;
-    while (index < entries.len) {
-        try build_checkpoint.tick(checkpoint);
-        if (projection.entry_actions.items[index] != .keep) {
-            index += 1;
-            continue;
-        }
-        const entry_id = toolStatusEntryId(entries[index]) orelse {
-            index += 1;
-            continue;
-        };
-
-        if (presentation_group_indices[index]) |group_index| {
-            const group = &presentation_groups.items[group_index];
-            if (index != group.anchor_index) {
-                projection.entry_actions.items[index] = .hide;
-                index += 1;
-                continue;
-            }
-            for (group.status_indices.items) |status_index| {
-                projection.entry_actions.items[status_index] = .hide;
-                hideAttachedRows(
-                    entries,
-                    projection.entry_actions.items,
-                    status_index,
-                );
-            }
-
-            const bytes = try formatGroupBlock(
-                alloc,
-                entries,
-                group.status_indices.items,
-                details,
-                &detail_indices,
-                group.summary,
-                focused_entry_id,
-                collapse_tool_calls,
-                cols,
-                style,
-                styles,
-            );
-            try projection.setOwnedGroup(alloc, index, bytes);
-            index += 1;
-            continue;
-        }
-
-        const detail = detailForEntry(details, &detail_indices, entry_id, stats);
-        if (statusNamesAsk(entries[index], detail)) {
-            index += 1;
-            continue;
-        }
-
-        const first_index = index;
-        var status_indices: std.ArrayList(usize) = .empty;
-        defer status_indices.deinit(alloc);
-        var summary: Summary = .{};
-
-        while (index < entries.len) : (index += 1) {
-            try build_checkpoint.tick(checkpoint);
-            if (!transcript_blocks.isEntryVisibleInCompactPresentation(entries[index])) continue;
-            if (presentation_group_indices[index] != null) break;
-            if (toolStatusEntryId(entries[index])) |group_entry_id| {
-                const group_detail = detailForEntry(details, &detail_indices, group_entry_id, stats);
-                if (statusNamesAsk(entries[index], group_detail)) break;
-                observeTool(&summary, group_detail);
-                try status_indices.append(alloc, index);
-                projection.entry_actions.items[index] = .hide;
-                continue;
-            }
-            if (isAttachedEntry(entries[index])) {
-                projection.entry_actions.items[index] = .hide;
-                continue;
-            }
-            if (!isTransparentCompactEntry(entries[index])) break;
-        }
-
-        const bytes = try formatGroupBlock(
-            alloc,
-            entries,
-            status_indices.items,
-            details,
-            &detail_indices,
-            summary,
-            focused_entry_id,
-            collapse_tool_calls,
-            cols,
-            style,
-            styles,
-        );
-        try projection.setOwnedGroup(alloc, first_index, bytes);
-    }
+    try projectCompactTieredTurns(
+        alloc,
+        &projection,
+        entries,
+        details,
+        &detail_indices,
+        presentation_group_indices,
+        presentation_groups.items,
+        focused_entry_id,
+        collapse,
+        cols,
+        style,
+        styles,
+        checkpoint,
+    );
 
     return projection;
 }
@@ -1216,7 +1638,7 @@ test "collapsed tool groups render only the summary header" {
         .{ .entry_id = 2, .tool_name = @constCast("list_files"), .activity_kind = .list },
     };
 
-    var projection = try buildStyledFocused(alloc, &entries, &details, 120, null, true, .{}, .{});
+    var projection = try buildStyledFocused(alloc, &entries, &details, 120, null, .{ .collapse_tool_calls = true }, .{}, .{});
     defer projection.deinit(alloc);
     const block = projection.entry_actions.items[0].override.bytes;
     try std.testing.expect(std.mem.find(u8, block, "2 tool calls") != null);
@@ -1499,7 +1921,7 @@ test "focused tool remains counted but is omitted from stable child rows" {
         .{ .entry_id = 2, .tool_name = @constCast("run_command"), .activity_kind = .command },
     };
 
-    var projection = try buildStyledFocused(alloc, &entries, &details, 120, 2, false, .{}, .{});
+    var projection = try buildStyledFocused(alloc, &entries, &details, 120, 2, .{}, .{}, .{});
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
@@ -1961,7 +2383,7 @@ test "cancelled actions remain inside the message-delimited block" {
     try std.testing.expect(projection.entry_actions.items[3] == .hide);
 }
 
-test "assistant prose splits tool groups and attached rows stay inside their group" {
+test "assistant prose relocates beneath turn umbrella with tools coalesced" {
     const alloc = std.testing.allocator;
     var entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{ .id = 1, .bytes = "command", .class = .tool_status } },
@@ -1983,8 +2405,12 @@ test "assistant prose splits tool groups and attached rows stay inside their gro
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
     try std.testing.expect(projection.entry_actions.items[2] == .hide);
-    try std.testing.expect(projection.entry_actions.items[3] == .keep);
-    try std.testing.expect(projection.entry_actions.items[4] == .override);
+    try std.testing.expect(projection.entry_actions.items[3] == .hide);
+    try std.testing.expect(projection.entry_actions.items[4] == .hide);
+    const block = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, block, "Tool activity") != null);
+    try std.testing.expect(std.mem.find(u8, block, "assistant message") != null);
+    try std.testing.expect(std.mem.find(u8, block, "2 tool call") != null);
 }
 
 test "minimal hides command output separated from its tool status" {
@@ -2005,9 +2431,10 @@ test "minimal hides command output separated from its tool status" {
     defer projection.deinit(alloc);
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
-    try std.testing.expect(projection.entry_actions.items[1] == .keep);
+    try std.testing.expect(projection.entry_actions.items[1] == .hide);
     try std.testing.expect(projection.entry_actions.items[2] == .hide);
-    try std.testing.expect(projection.entry_actions.items[3] == .keep);
+    try std.testing.expect(projection.entry_actions.items[3] == .hide);
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "provider bridge") != null);
 }
 
 test "one presentation group keeps sibling tools in creation order across assistant prose" {
@@ -2039,13 +2466,13 @@ test "one presentation group keeps sibling tools in creation order across assist
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
 
-    try std.testing.expectEqualStrings(
-        "● 2 tool calls · 2 commands\n" ++
-            "├ Running first\n" ++
-            "└ Running second",
-        projection.entry_actions.items[0].override.bytes,
-    );
-    try std.testing.expect(projection.entry_actions.items[1] == .keep);
+    const sibling_block = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, sibling_block, "Tool activity") != null);
+    try std.testing.expect(std.mem.find(u8, sibling_block, "2 tool calls · 2 commands") != null);
+    try std.testing.expect(std.mem.find(u8, sibling_block, "Running first") != null);
+    try std.testing.expect(std.mem.find(u8, sibling_block, "Running second") != null);
+    try std.testing.expect(std.mem.find(u8, sibling_block, "provider bridge") != null);
+    try std.testing.expect(projection.entry_actions.items[1] == .hide);
     try std.testing.expect(projection.entry_actions.items[2] == .hide);
 }
 
@@ -2117,10 +2544,14 @@ test "legacy lifecycle records without group identity respect transcript boundar
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
-    try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Running second",
-        projection.entry_actions.items[2].override.bytes,
-    );
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    try std.testing.expect(projection.entry_actions.items[1] == .hide);
+    try std.testing.expect(projection.entry_actions.items[2] == .hide);
+    const legacy_block = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, legacy_block, "Tool activity") != null);
+    try std.testing.expect(std.mem.find(u8, legacy_block, "next model step") != null);
+    try std.testing.expect(std.mem.find(u8, legacy_block, "Read first") != null);
+    try std.testing.expect(std.mem.find(u8, legacy_block, "Running second") != null);
 }
 
 fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
@@ -2153,12 +2584,10 @@ fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
         else => return err,
     };
     defer projection.deinit(alloc);
-    try std.testing.expectEqualStrings(
-        "● 2 tool calls · 2 commands\n" ++
-            "├ Running first\n" ++
-            "└ Running second",
-        projection.entry_actions.items[0].override.bytes,
-    );
+    const alloc_block = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, alloc_block, "2 tool calls · 2 commands") != null);
+    try std.testing.expect(std.mem.find(u8, alloc_block, "Running first") != null);
+    try std.testing.expect(std.mem.find(u8, alloc_block, "Running second") != null);
 }
 
 test "presentation grouping is atomic across allocation failures" {
@@ -2240,25 +2669,15 @@ test "visible assistant messages split groups while silent entries do not" {
     var projection = try build(alloc, &entries, &details, 120);
     defer projection.deinit(alloc);
 
-    try std.testing.expectEqualStrings(
-        "● 5 tool calls · 3 read · 2 list\n" ++
-            "├ read_file\n├ read_file\n├ read_file\n├ glob_files\n└ glob_files",
-        projection.entry_actions.items[0].override.bytes,
-    );
-    for (projection.entry_actions.items[1..5]) |action| {
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    for (projection.entry_actions.items[1..]) |action| {
         try std.testing.expect(action == .hide);
     }
-    try std.testing.expect(projection.entry_actions.items[5] == .keep);
-    try std.testing.expect(projection.entry_actions.items[6] == .override);
-    try std.testing.expect(projection.entry_actions.items[7] == .keep);
-    try std.testing.expectEqualStrings(
-        "● 4 tool calls · 3 read · 1 command\n" ++
-            "├ read_file\n├ read_file\n├ read_file\n└ run_command",
-        projection.entry_actions.items[8].override.bytes,
-    );
-    for (projection.entry_actions.items[9..12]) |action| {
-        try std.testing.expect(action == .hide);
-    }
+    const visible_block = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, visible_block, "Tool activity") != null);
+    try std.testing.expect(std.mem.find(u8, visible_block, "permission feedback") != null);
+    try std.testing.expect(std.mem.find(u8, visible_block, "next model step") != null);
+    try std.testing.expect(std.mem.find(u8, visible_block, "10 tool call") != null);
 }
 
 test "message-delimited groups hide attached detail across compact-only entries" {
@@ -2289,8 +2708,9 @@ test "message-delimited groups hide attached detail across compact-only entries"
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
     try std.testing.expect(projection.entry_actions.items[2] == .hide);
-    try std.testing.expect(projection.entry_actions.items[3] == .keep);
-    try std.testing.expect(projection.entry_actions.items[4] == .override);
+    try std.testing.expect(projection.entry_actions.items[3] == .hide);
+    try std.testing.expect(projection.entry_actions.items[4] == .hide);
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "visible message") != null);
 }
 
 test "ask activity remains outside tool groups" {

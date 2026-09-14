@@ -1,4 +1,5 @@
 const std = @import("std");
+const tool_collapse_state = @import("tool_collapse_state.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const diagnostics = @import("../../core/workspace/diagnostics.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
@@ -4310,9 +4311,11 @@ pub const TranscriptRuntime = struct {
     full_transcript_prepared_page_visible: bool = false,
     full_transcript_content_revision: u64 = 0,
     compact_transcript_source_cache: CompactTranscriptSourceCache = .{},
-    /// When enabled, compact transcript tool groups render only their summary
-    /// header while the full transcript retains every individual tool call.
+    /// When enabled, compact transcript T1 groups default to header-only.
+    /// Per-node expand state lives in `tool_collapse`.
     collapse_tool_calls: bool = false,
+    /// Marionette-style per-node expand/collapse (T0 turn / T1 groups).
+    tool_collapse: tool_collapse_state.ToolCollapseTree = .{},
     /// Structured-entry store used to regenerate transcript bytes at the
     /// current width while retaining the raw byte buffer for append paths
     /// that still write pre-rendered transcript content.
@@ -4430,6 +4433,7 @@ pub const TranscriptRuntime = struct {
         self.full_transcript_page_load.deinit();
         self.discardInstalledFullTranscriptPage();
         self.compact_transcript_source_cache.deinit(alloc);
+        self.tool_collapse.deinit(alloc);
         self.lifecycle_state.deinit(alloc);
         for (self.tool_details.items) |*detail| detail.deinit(alloc);
         self.tool_details.deinit(alloc);
