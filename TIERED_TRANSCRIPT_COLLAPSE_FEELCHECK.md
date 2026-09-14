@@ -25,7 +25,7 @@ Composer must be empty. Keys step the preferred/live tool turn:
 
 If you only ever see the umbrella open/close with `●` summaries and never `├`/`└`, level 3 is broken.
 
-`Enter` / `Space` (Space only while streaming) still toggles T0 for the preferred turn.
+Hotkeys are **`[` / `]` only** — Space and Enter are not collapse keys (Enter submits / Space types as usual).
 
 ## Mid-stream hotkeys
 
@@ -73,6 +73,20 @@ assistant prose stream…            ← protected continuous class beneath
 6. Press `[` / `[` back to full collapse.
 7. Scroll up, hit a hotkey — confirm no snap to bottom.
 8. `Ctrl+O` still opens full detail.
+9. Quit and `./zig-out/bin/fx -c` — sticky umbrella should show for the latest tool turn without pressing `[`/`]` first.
+10. Confirm Space/Enter do **not** toggle collapse (only `[`/`]`).
+
+
+## Resume (`fx -c`)
+
+`ToolCollapseTree` is memory-only (not written into `~/.fx/sessions/<id>/`). On continue/resume after history load:
+
+- Preferred turn is **re-seeded** from the newest tool_detail lifecycle/presentation `turn_id` (same helper hotkeys use).
+- Sticky T0 / hotkey umbrella chrome should be **active immediately** for that latest tool-bearing turn.
+- Turns with interleaved protected prose still umbrella even without preferred (unchanged).
+- Expand-level maps are not yet persisted; defaults from **Collapse tool calls** apply until you press `[`/`]`.
+
+Feel-check: `cd ~/Projects/fx-umbrella && ./zig-out/bin/fx -c` on a prior tool-heavy session — sticky umbrella should show without needing a hotkey first.
 
 ## Deferred (not this wave)
 

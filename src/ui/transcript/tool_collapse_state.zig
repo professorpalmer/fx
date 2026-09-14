@@ -169,6 +169,15 @@ pub const ToolCollapseTree = struct {
         self.preserve_viewport_on_next_paint = false;
         return value;
     }
+
+    /// After resume/history install, stick preferred to the newest tool turn so
+    /// sticky/hotkey umbrella chrome is active immediately (tree is memory-only).
+    pub fn reseedPreferredTurnFromToolDetails(self: *ToolCollapseTree, details: anytype) void {
+        if (self.preferred_turn_key != null) return;
+        if (newestTurnKeyFromToolDetails(details)) |key| {
+            self.ensurePreferredTurn(key);
+        }
+    }
 };
 
 pub const CollapseDefaults = struct {
@@ -198,6 +207,27 @@ pub fn turnKeyFromLifecycle(turn_id: u64) u64 {
 pub fn turnKeySynthetic(span_start_entry_id: u32) u64 {
     return 0xC000_0000_0000_0000 | @as(u64, span_start_entry_id);
 }
+
+/// Newest lifecycle/presentation turn key from loaded tool details (resume + hotkeys).
+/// Walks in storage order so the last tool-bearing detail wins — same rule hotkeys use.
+pub fn turnKeyFromToolDetail(detail: anytype) ?u64 {
+    if (detail.lifecycle_id) |lifecycle| {
+        return turnKeyFromLifecycle(lifecycle.turn_id);
+    }
+    if (detail.presentation_group_id) |group| {
+        return turnKeyFromLifecycle(group.turn_id);
+    }
+    return null;
+}
+
+pub fn newestTurnKeyFromToolDetails(details: anytype) ?u64 {
+    var newest: ?u64 = null;
+    for (details) |detail| {
+        if (turnKeyFromToolDetail(detail)) |key| newest = key;
+    }
+    return newest;
+}
+
 
 test "collapse defaults follow collapse_tool_calls" {
     const collapsed = CollapseDefaults.fromCollapseToolCalls(true);
@@ -252,3 +282,22 @@ test "ensurePreferredTurn sticks mid-stream and advances on new turn" {
     try std.testing.expectEqual(@as(?u64, 99), tree.preferred_turn_key);
     try std.testing.expect(!tree.t1_force_expanded);
 }
+
+test "newestTurnKeyFromToolDetails picks last lifecycle turn" {
+    const Detail = struct {
+        lifecycle_id: ?struct { turn_id: u64, call_id: []const u8 } = null,
+        presentation_group_id: ?struct { turn_id: u64, anchor_step_id: u32 } = null,
+    };
+    const details = [_]Detail{
+        .{ .lifecycle_id = .{ .turn_id = 3, .call_id = "a" } },
+        .{ .presentation_group_id = .{ .turn_id = 9, .anchor_step_id = 1 } },
+        .{ .lifecycle_id = .{ .turn_id = 7, .call_id = "b" } },
+    };
+    try std.testing.expectEqual(@as(?u64, 7), newestTurnKeyFromToolDetails(details[0..]));
+    var tree: ToolCollapseTree = .{};
+    tree.reseedPreferredTurnFromToolDetails(details[0..]);
+    try std.testing.expectEqual(@as(?u64, 7), tree.preferred_turn_key);
+    tree.reseedPreferredTurnFromToolDetails(details[0..]);
+    try std.testing.expectEqual(@as(?u64, 7), tree.preferred_turn_key);
+}
+

@@ -1463,7 +1463,6 @@ pub fn Runtime(comptime App: type) type {
                 },
                 ' ' => {
                     dismissMentionSkillsMenuForSpace(app);
-                    if (try routeTieredCollapseHotkey(app, ' ')) return;
                     if (app.input_runtime.edit_state.selectionRange() == null and
                         !commandSkillsMenuActive(app) and
                         completion_rt.hasModelQuery(app))
@@ -1537,9 +1536,6 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                         return;
                     }
-                    if (app.input_runtime.edit_state.input.items.len == 0) {
-                        if (try routeTieredCollapseHotkey(app, '\r')) return;
-                    }
                     debug_trace.logf("input", "submit requested stream_active={s} queued={d} input_bytes={d}", .{ if (app.stream.active) "true" else "false", app.worker.queuedPromptCount(), app.input_runtime.edit_state.input.items.len });
                     try submit_rt.submit(app, max_prompt_history);
                 },
@@ -1586,11 +1582,13 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Marionette-style mid-run collapse hotkeys. Composer must be empty so
-        /// drafting `[` / `]` / Space is undisturbed. Updates apply synchronously
-        /// onto `tool_collapse` even while `stream.active` so the next paint
-        /// reflects the new level without waiting for a worker turn break.
+        /// drafting `[` / `]` is undisturbed. Only `[` / `]` change collapse level
+        /// (Space/Enter are not collapse keys). Updates apply synchronously onto
+        /// `tool_collapse` even while `stream.active` so the next paint reflects
+        /// the new level without waiting for a worker turn break.
         fn routeTieredCollapseHotkey(app: *App, byte: u8) !bool {
             if (comptime !@hasField(@TypeOf(app.shell), "tool_collapse")) return false;
+            if (byte != '[' and byte != ']') return false;
             if (app.input_runtime.edit_state.input.items.len != 0) return false;
             if (modelMenuActive(app) or helpMenuActive(app) or commandSkillsMenuActive(app)) return false;
             const defaults = tool_collapse_state.CollapseDefaults.fromCollapseToolCalls(
@@ -1599,17 +1597,9 @@ pub fn Runtime(comptime App: type) type {
                 else
                     false,
             );
-            const turn_key = app.shell.tool_collapse.preferred_turn_key orelse blk: {
-                var newest: ?u64 = null;
-                for (app.shell.tool_details.items) |detail| {
-                    if (detail.lifecycle_id) |lifecycle| {
-                        newest = tool_collapse_state.turnKeyFromLifecycle(lifecycle.turn_id);
-                    } else if (detail.presentation_group_id) |group| {
-                        newest = tool_collapse_state.turnKeyFromLifecycle(group.turn_id);
-                    }
-                }
-                break :blk newest orelse return false;
-            };
+            const turn_key = app.shell.tool_collapse.preferred_turn_key orelse
+                tool_collapse_state.newestTurnKeyFromToolDetails(app.shell.tool_details.items) orelse
+                return false;
             app.shell.tool_collapse.ensurePreferredTurn(turn_key);
             switch (byte) {
                 '[' => {
@@ -1620,19 +1610,6 @@ pub fn Runtime(comptime App: type) type {
                 },
                 ']' => {
                     try app.shell.tool_collapse.stepExpand(app.alloc, turn_key, defaults);
-                    app.shell.tool_collapse.markPreserveViewport();
-                    app.shell.render_requests.request(.transcript);
-                    return true;
-                },
-                ' ' => {
-                    if (!app.stream.active) return false;
-                    try app.shell.tool_collapse.toggleTurn(app.alloc, turn_key, defaults);
-                    app.shell.tool_collapse.markPreserveViewport();
-                    app.shell.render_requests.request(.transcript);
-                    return true;
-                },
-                '\r' => {
-                    try app.shell.tool_collapse.toggleTurn(app.alloc, turn_key, defaults);
                     app.shell.tool_collapse.markPreserveViewport();
                     app.shell.render_requests.request(.transcript);
                     return true;
