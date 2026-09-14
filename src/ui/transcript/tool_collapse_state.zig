@@ -7,8 +7,19 @@ pub const ToolCollapseTree = struct {
     turn_expanded: std.AutoHashMapUnmanaged(u64, bool) = .empty,
     group_expanded: std.AutoHashMapUnmanaged(u64, bool) = .empty,
     preferred_turn_key: ?u64 = null,
-    /// After `]`, unrecorded T1 nodes stay collapsed until explicitly expanded.
+    /// After a headers-only step, unrecorded T1 nodes stay collapsed.
     t1_force_collapsed: bool = false,
+    /// After a details step, unrecorded T1 nodes stay expanded.
+    t1_force_expanded: bool = false,
+
+    pub const Level = enum {
+        /// ▶ T0 umbrella only
+        t0_only,
+        /// ▼ T0 + ● T1 headers
+        t1_headers,
+        /// ▼ T0 + expanded T1 tool rows
+        t1_details,
+    };
 
     pub fn deinit(self: *ToolCollapseTree, alloc: std.mem.Allocator) void {
         self.turn_expanded.deinit(alloc);
@@ -26,6 +37,7 @@ pub const ToolCollapseTree = struct {
 
     pub fn groupIsExpanded(self: *const ToolCollapseTree, group_key: u64, defaults: CollapseDefaults) bool {
         if (self.group_expanded.get(group_key)) |value| return value;
+        if (self.t1_force_expanded) return true;
         if (self.t1_force_collapsed) return false;
         return defaults.group_expanded;
     }
@@ -39,25 +51,64 @@ pub const ToolCollapseTree = struct {
         try self.group_expanded.put(alloc, group_key, expanded);
     }
 
-    /// `[` — collapse preferred turn to T0 umbrella only.
-    pub fn collapseAllToT0(self: *ToolCollapseTree, alloc: std.mem.Allocator) !void {
-        if (self.preferred_turn_key) |turn_key| {
-            try self.setTurnExpanded(alloc, turn_key, false);
-            return;
+    pub fn levelForTurn(self: *const ToolCollapseTree, turn_key: u64, defaults: CollapseDefaults) Level {
+        if (!self.turnIsExpanded(turn_key, defaults)) return .t0_only;
+        if (self.t1_force_expanded) return .t1_details;
+        if (self.t1_force_collapsed) return .t1_headers;
+        if (defaults.group_expanded) return .t1_details;
+        return .t1_headers;
+    }
+
+    /// `[` — step collapse: details → headers → T0 only.
+    pub fn stepCollapse(self: *ToolCollapseTree, alloc: std.mem.Allocator, turn_key: u64, defaults: CollapseDefaults) !void {
+        switch (self.levelForTurn(turn_key, defaults)) {
+            .t1_details => try self.expandT0KeepT1Collapsed(alloc, turn_key),
+            .t1_headers => try self.collapseAllToT0(alloc, turn_key),
+            .t0_only => {
+                self.setPreferredTurn(turn_key);
+            },
         }
-        var it = self.turn_expanded.iterator();
+    }
+
+    /// `]` — step expand: T0 only → headers → details.
+    pub fn stepExpand(self: *ToolCollapseTree, alloc: std.mem.Allocator, turn_key: u64, defaults: CollapseDefaults) !void {
+        switch (self.levelForTurn(turn_key, defaults)) {
+            .t0_only => try self.expandT0KeepT1Collapsed(alloc, turn_key),
+            .t1_headers => try self.expandT1Details(alloc, turn_key),
+            .t1_details => {
+                self.setPreferredTurn(turn_key);
+            },
+        }
+    }
+
+    pub fn collapseAllToT0(self: *ToolCollapseTree, alloc: std.mem.Allocator, turn_key: u64) !void {
+        try self.setTurnExpanded(alloc, turn_key, false);
+        self.t1_force_expanded = false;
+        // Keep t1_force_collapsed so re-opening with ] lands on headers first.
+        self.t1_force_collapsed = true;
+        var it = self.group_expanded.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.* = false;
         }
     }
 
-    /// `]` — expand T0; keep T1 at headers only.
     pub fn expandT0KeepT1Collapsed(self: *ToolCollapseTree, alloc: std.mem.Allocator, turn_key: u64) !void {
         try self.setTurnExpanded(alloc, turn_key, true);
+        self.t1_force_expanded = false;
         self.t1_force_collapsed = true;
         var it = self.group_expanded.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.* = false;
+        }
+    }
+
+    pub fn expandT1Details(self: *ToolCollapseTree, alloc: std.mem.Allocator, turn_key: u64) !void {
+        try self.setTurnExpanded(alloc, turn_key, true);
+        self.t1_force_collapsed = false;
+        self.t1_force_expanded = true;
+        var it = self.group_expanded.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.* = true;
         }
     }
 
@@ -103,18 +154,29 @@ test "collapse defaults follow collapse_tool_calls" {
     try std.testing.expect(expanded.group_expanded);
 }
 
-test "tree bracket ops" {
+test "bracket level walk expands past T1 headers" {
     const alloc = std.testing.allocator;
     var tree: ToolCollapseTree = .{};
     defer tree.deinit(alloc);
     const defaults = CollapseDefaults.fromCollapseToolCalls(true);
-    try tree.toggleTurn(alloc, 7, defaults);
-    try std.testing.expect(!tree.turnIsExpanded(7, defaults));
-    try tree.expandT0KeepT1Collapsed(alloc, 7);
-    try std.testing.expect(tree.turnIsExpanded(7, defaults));
-    try tree.setGroupExpanded(alloc, 99, true);
-    try tree.expandT0KeepT1Collapsed(alloc, 7);
+
+    // Default with collapse_tool_calls: T0 open, T1 headers.
+    try std.testing.expect(tree.levelForTurn(7, defaults) == .t1_headers);
+
+    try tree.stepExpand(alloc, 7, defaults);
+    try std.testing.expect(tree.levelForTurn(7, defaults) == .t1_details);
+    try std.testing.expect(tree.groupIsExpanded(99, defaults));
+
+    try tree.stepCollapse(alloc, 7, defaults);
+    try std.testing.expect(tree.levelForTurn(7, defaults) == .t1_headers);
     try std.testing.expect(!tree.groupIsExpanded(99, defaults));
-    try tree.collapseAllToT0(alloc);
-    try std.testing.expect(!tree.turnIsExpanded(7, defaults));
+
+    try tree.stepCollapse(alloc, 7, defaults);
+    try std.testing.expect(tree.levelForTurn(7, defaults) == .t0_only);
+
+    try tree.stepExpand(alloc, 7, defaults);
+    try std.testing.expect(tree.levelForTurn(7, defaults) == .t1_headers);
+
+    try tree.stepExpand(alloc, 7, defaults);
+    try std.testing.expect(tree.levelForTurn(7, defaults) == .t1_details);
 }

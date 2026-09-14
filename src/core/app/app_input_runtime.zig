@@ -1536,9 +1536,6 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                         return;
                     }
-                    if (app.input_runtime.edit_state.input.items.len == 0) {
-                        if (try routeTieredCollapseHotkey(app, '\r')) return;
-                    }
                     debug_trace.logf("input", "submit requested stream_active={s} queued={d} input_bytes={d}", .{ if (app.stream.active) "true" else "false", app.worker.queuedPromptCount(), app.input_runtime.edit_state.input.items.len });
                     try submit_rt.submit(app, max_prompt_history);
                 },
@@ -1585,11 +1582,12 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Marionette-style mid-run collapse hotkeys. Composer must be empty so
-        /// drafting `[` / `]` / Space is undisturbed.
+        /// drafting `[` / `]` is undisturbed. Space/Enter intentionally not used.
         fn routeTieredCollapseHotkey(app: *App, byte: u8) !bool {
             if (comptime !@hasField(@TypeOf(app.shell), "tool_collapse")) return false;
             if (app.input_runtime.edit_state.input.items.len != 0) return false;
             if (modelMenuActive(app) or helpMenuActive(app) or commandSkillsMenuActive(app)) return false;
+            if (byte != '[' and byte != ']') return false;
             const defaults = tool_collapse_state.CollapseDefaults.fromCollapseToolCalls(
                 if (comptime @hasField(@TypeOf(app.shell), "collapse_tool_calls"))
                     app.shell.collapse_tool_calls
@@ -1599,35 +1597,21 @@ pub fn Runtime(comptime App: type) type {
             const turn_key = app.shell.tool_collapse.preferred_turn_key orelse blk: {
                 var newest: ?u64 = null;
                 for (app.shell.tool_details.items) |detail| {
-                    if (detail.lifecycle_id) |lifecycle| newest = lifecycle.turn_id;
+                    if (detail.lifecycle_id) |lifecycle| {
+                        newest = tool_collapse_state.turnKeyFromLifecycle(lifecycle.turn_id);
+                    } else if (detail.presentation_group_id) |group| {
+                        newest = tool_collapse_state.turnKeyFromLifecycle(group.turn_id);
+                    }
                 }
                 break :blk newest orelse return false;
             };
             switch (byte) {
-                '[' => {
-                    try app.shell.tool_collapse.collapseAllToT0(app.alloc);
-                    app.shell.tool_collapse.setPreferredTurn(turn_key);
-                    app.shell.render_requests.request(.transcript);
-                    return true;
-                },
-                ']' => {
-                    try app.shell.tool_collapse.expandT0KeepT1Collapsed(app.alloc, turn_key);
-                    app.shell.render_requests.request(.transcript);
-                    return true;
-                },
-                ' ' => {
-                    if (!app.stream.active) return false;
-                    try app.shell.tool_collapse.toggleTurn(app.alloc, turn_key, defaults);
-                    app.shell.render_requests.request(.transcript);
-                    return true;
-                },
-                '\r' => {
-                    try app.shell.tool_collapse.toggleTurn(app.alloc, turn_key, defaults);
-                    app.shell.render_requests.request(.transcript);
-                    return true;
-                },
+                '[' => try app.shell.tool_collapse.stepCollapse(app.alloc, turn_key, defaults),
+                ']' => try app.shell.tool_collapse.stepExpand(app.alloc, turn_key, defaults),
                 else => return false,
             }
+            app.shell.render_requests.request(.transcript);
+            return true;
         }
 
         /// While the picker borrows the composer, destructive global gestures
