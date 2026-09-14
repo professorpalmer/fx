@@ -2731,6 +2731,10 @@ test "ask activity remains outside tool groups" {
 
     try std.testing.expect(projection.entry_actions.items[0] == .keep);
     try std.testing.expect(projection.entry_actions.items[1] == .override);
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 read\n└ read_file",
+        projection.entry_actions.items[1].override.bytes,
+    );
 }
 
 test "ask activity remains outside tool groups without complete detail metadata" {
@@ -2756,6 +2760,10 @@ test "ask activity remains outside tool groups without complete detail metadata"
     try std.testing.expectEqualStrings(
         "● 1 tool call\n└ Reading /tmp/ask_user_question",
         projection.entry_actions.items[0].override.bytes,
+    );
+    try std.testing.expectEqualStrings(
+        "● 1 tool call · 1 read\n└ read_file",
+        projection.entry_actions.items[2].override.bytes,
     );
 }
 
