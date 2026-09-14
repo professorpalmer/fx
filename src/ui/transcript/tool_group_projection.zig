@@ -1091,21 +1091,43 @@ fn indentBlockLines(alloc: std.mem.Allocator, block: []const u8, indent: []const
     return out.toOwnedSlice();
 }
 
+fn collapseExcessBlankLines(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    var newline_run: usize = 0;
+    for (text) |byte| {
+        if (byte == '\n') {
+            newline_run += 1;
+            if (newline_run <= 2) try out.writer.writeByte('\n');
+            continue;
+        }
+        newline_run = 0;
+        try out.writer.writeByte(byte);
+    }
+    return out.toOwnedSlice();
+}
+
 fn appendProtectedProse(
-    _: std.mem.Allocator,
+    alloc: std.mem.Allocator,
     out: *std.Io.Writer.Allocating,
     entries: []const TranscriptEntry,
     prose_indices: []const usize,
 ) !void {
+    // Model chunks often already end with \n / \n\n. Trim edges, cap blank runs
+    // at one empty row, and join turns with a single blank line so relocated
+    // prose does not stack into huge gaps.
     var wrote_any = false;
     for (prose_indices) |index| {
-        const text = switch (entries[index]) {
+        const raw = switch (entries[index]) {
             .assistant_turn => |assistant| assistant.segments.text.items,
             else => continue,
         };
-        if (text.len == 0) continue;
-        if (wrote_any) try out.writer.writeByte('\n');
-        try out.writer.writeAll(text);
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const chunk = try collapseExcessBlankLines(alloc, trimmed);
+        defer alloc.free(chunk);
+        if (wrote_any) try out.writer.writeAll("\n\n");
+        try out.writer.writeAll(chunk);
         wrote_any = true;
     }
 }
@@ -1405,18 +1427,28 @@ fn projectTieredTurn(
         try appendProtectedProse(alloc, &prose_buf, entries, prose_indices.items);
         if (prose_buf.writer.end > 0) {
             const prose_bytes = prose_buf.writer.buffer[0..prose_buf.writer.end];
+            // One blank row between tool region and protected prose.
             try out.writer.writeAll("\n\n");
             try lines.append(alloc, .block_separator);
-            const prose_start = out.writer.end;
-            try out.writer.writeAll(prose_bytes);
-            const prose_entry_id = entries[prose_indices.items[0]].id();
-            const written = out.writer.buffer[prose_start..out.writer.end];
-            const prose_line_count = std.mem.count(u8, std.mem.trimEnd(u8, written, "\n"), "\n") + 1;
-            try lines.appendNTimes(alloc, .{ .entry = .{
-                .entry_id = prose_entry_id,
-                .entry_class = .assistant_turn,
-                .projection_part = .body,
-            } }, prose_line_count);
+            // Emit prose line-by-line so blank join rows are block_separator and
+            // body rows keep assistant provenance (keeps paint density honest).
+            var prose_lines = std.mem.splitScalar(u8, prose_bytes, '\n');
+            var first_prose_line = true;
+            while (prose_lines.next()) |line| {
+                if (!first_prose_line) try out.writer.writeByte('\n');
+                first_prose_line = false;
+                try out.writer.writeAll(line);
+                if (line.len == 0) {
+                    try lines.append(alloc, .block_separator);
+                } else {
+                    const prose_entry_id = entries[prose_indices.items[0]].id();
+                    try lines.append(alloc, .{ .entry = .{
+                        .entry_id = prose_entry_id,
+                        .entry_class = .assistant_turn,
+                        .projection_part = .body,
+                    } });
+                }
+            }
         }
     }
 
@@ -2435,6 +2467,28 @@ test "assistant prose relocates beneath turn umbrella with tools coalesced" {
     try std.testing.expect(std.mem.find(u8, block, "Tool activity") != null);
     try std.testing.expect(std.mem.find(u8, block, "assistant message") != null);
     try std.testing.expect(std.mem.find(u8, block, "2 tool call") != null);
+}
+
+test "umbrella prose join trims stacked newlines" {
+    const alloc = std.testing.allocator;
+    var entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "command", .class = .tool_status } },
+        .{ .assistant_turn = .{ .id = 2, .segments = .{} } },
+        .{ .assistant_turn = .{ .id = 3, .segments = .{} } },
+    };
+    try entries[1].assistant_turn.segments.text.appendSlice(alloc, "first paragraph\n\n");
+    try entries[2].assistant_turn.segments.text.appendSlice(alloc, "\n\nsecond paragraph\n");
+    defer entries[1].assistant_turn.segments.deinit(alloc);
+    defer entries[2].assistant_turn.segments.deinit(alloc);
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+    const block = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, block, "first paragraph\n\nsecond paragraph") != null);
+    try std.testing.expect(std.mem.find(u8, block, "first paragraph\n\n\n\nsecond") == null);
 }
 
 test "umbrella prose separator keeps line provenance aligned" {
