@@ -1396,13 +1396,22 @@ fn projectTieredTurn(
     }
 
     if (prose_indices.items.len > 0) {
-        try out.writer.writeAll("\n\n");
-        const prose_start = out.writer.end;
-        try appendProtectedProse(alloc, &out, entries, prose_indices.items);
-        if (out.writer.end > prose_start) {
+        // Emit the blank separator only after prose actually writes, and keep
+        // line_provenance aligned with hard lines (ReleaseSafe assert in
+        // transcript_blocks.prepare). Mid-stream empty assistant turns must not
+        // leave orphan newlines in the umbrella override.
+        var prose_buf: std.Io.Writer.Allocating = .init(alloc);
+        defer prose_buf.deinit();
+        try appendProtectedProse(alloc, &prose_buf, entries, prose_indices.items);
+        if (prose_buf.writer.end > 0) {
+            const prose_bytes = prose_buf.writer.buffer[0..prose_buf.writer.end];
+            try out.writer.writeAll("\n\n");
+            try lines.append(alloc, .block_separator);
+            const prose_start = out.writer.end;
+            try out.writer.writeAll(prose_bytes);
             const prose_entry_id = entries[prose_indices.items[0]].id();
-            const prose_bytes = out.writer.buffer[prose_start..out.writer.end];
-            const prose_line_count = std.mem.count(u8, std.mem.trimEnd(u8, prose_bytes, "\n"), "\n") + 1;
+            const written = out.writer.buffer[prose_start..out.writer.end];
+            const prose_line_count = std.mem.count(u8, std.mem.trimEnd(u8, written, "\n"), "\n") + 1;
             try lines.appendNTimes(alloc, .{ .entry = .{
                 .entry_id = prose_entry_id,
                 .entry_class = .assistant_turn,
@@ -2426,6 +2435,41 @@ test "assistant prose relocates beneath turn umbrella with tools coalesced" {
     try std.testing.expect(std.mem.find(u8, block, "Tool activity") != null);
     try std.testing.expect(std.mem.find(u8, block, "assistant message") != null);
     try std.testing.expect(std.mem.find(u8, block, "2 tool call") != null);
+}
+
+test "umbrella prose separator keeps line provenance aligned" {
+    const alloc = std.testing.allocator;
+    var entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "command", .class = .tool_status } },
+        .{ .assistant_turn = .{ .id = 2, .segments = .{} } },
+    };
+    try entries[1].assistant_turn.segments.text.appendSlice(alloc, "streamed prose");
+    defer entries[1].assistant_turn.segments.deinit(alloc);
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    const override = projection.entry_actions.items[0].override;
+    const hard_lines = std.mem.count(u8, std.mem.trimEnd(u8, override.bytes, "\n"), "\n") + 1;
+    try std.testing.expectEqual(hard_lines, override.line_provenance.len);
+    try std.testing.expect(std.mem.find(u8, override.bytes, "streamed prose") != null);
+
+    // Empty assistant turn must not emit orphan separator newlines.
+    var empty_entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "command", .class = .tool_status } },
+        .{ .assistant_turn = .{ .id = 2, .segments = .{} } },
+    };
+    defer empty_entries[1].assistant_turn.segments.deinit(alloc);
+    var empty_projection = try build(alloc, &empty_entries, &details, 120);
+    defer empty_projection.deinit(alloc);
+    const empty_override = empty_projection.entry_actions.items[0].override;
+    const empty_hard = std.mem.count(u8, std.mem.trimEnd(u8, empty_override.bytes, "\n"), "\n") + 1;
+    try std.testing.expectEqual(empty_hard, empty_override.line_provenance.len);
+    try std.testing.expect(std.mem.find(u8, empty_override.bytes, "\n\n") == null);
 }
 
 test "minimal hides command output separated from its tool status" {
