@@ -24,8 +24,10 @@ pub const StableRetainCandidate = struct {
     committed_layout_id: u64,
     committed_flow: []const u8,
     committed_occupied_last_row: u16,
+    committed_sticky_rows: u16 = 0,
     source_layout: frame_layout.CommittedLayoutSnapshot,
     source_bytes: []const u8,
+    source_sticky_rows: u16 = 0,
     target_layout: frame_layout.CommittedLayoutSnapshot,
     scroll_plan: frame_scroll_plan.FrameScrollPlan,
     destructive_invalidation: bool = false,
@@ -40,6 +42,9 @@ pub fn stableRetainedTranscriptBody(candidate: StableRetainCandidate) ?RetainedT
 fn candidateHasStableSource(candidate: StableRetainCandidate) bool {
     if (candidate.full_transcript_active) return false;
     if (candidate.committed_layout_id != candidate.source_layout.layout_id) return false;
+    // Sticky inset changes move body rows without changing body flow bytes —
+    // refuse retain so vacated T1 chrome cannot ghost in the scrolling region.
+    if (candidate.committed_sticky_rows != candidate.source_sticky_rows) return false;
     return std.mem.eql(u8, candidate.source_bytes, candidate.committed_flow);
 }
 

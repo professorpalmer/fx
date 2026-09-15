@@ -148,6 +148,8 @@ const CommittedTranscriptAnchor = struct {
     /// The offset gap alone is insufficient because footer displacement can
     /// create the same shape without content debt.
     history_catchup_pending: bool = false,
+    /// Sticky umbrella rows pinned at the transcript top on this commit.
+    sticky_rows: u16 = 0,
 
     fn deinit(self: *CommittedTranscriptAnchor, alloc: Allocator) void {
         self.retention_identity.deinit(alloc);
@@ -471,6 +473,7 @@ pub const TranscriptTransition = struct {
     trace_visible_rows: u16,
     measured_history_origin: ?transcript_painter.MeasuredHistoryOrigin = null,
     row_provenance: []transcript_blocks.RowProvenance = &.{},
+    sticky_rows: u16 = 0,
     normal_buffer_recovery_pending: bool = false,
     history_catchup_pending: bool = false,
     consumed: bool = false,
@@ -4319,6 +4322,9 @@ pub const TranscriptRuntime = struct {
     /// Preferred-turn T0 (+ compact T1 headers) painted sticky at the top of the
     /// compact transcript viewport. Owned; refreshed each preparation.
     sticky_umbrella_chrome: ?[]u8 = null,
+    /// Last painted sticky inset — used to blank vacated rows when sticky shrinks.
+    last_sticky_umbrella_top: u16 = 0,
+    last_sticky_umbrella_rows: u16 = 0,
     /// Structured-entry store used to regenerate transcript bytes at the
     /// current width while retaining the raw byte buffer for append paths
     /// that still write pre-rendered transcript content.
@@ -7703,6 +7709,7 @@ pub const TranscriptRuntime = struct {
         cursor_row: u16,
         cursor_col: u16,
         measured_history_origin: ?transcript_painter.MeasuredHistoryOrigin,
+        sticky_rows: u16 = 0,
         normal_buffer_recovery_pending: bool = false,
         history_catchup_pending: bool = false,
         staged_flow_end: ?usize = null,
@@ -7725,6 +7732,7 @@ pub const TranscriptRuntime = struct {
                 .cursor_row = prepared.cursor.cursor_row,
                 .cursor_col = prepared.cursor.cursor_col,
                 .measured_history_origin = prepared.measured_history_origin,
+                .sticky_rows = prepared.sticky_rows,
             };
         }
 
@@ -7866,6 +7874,7 @@ pub const TranscriptRuntime = struct {
         self: *const TranscriptRuntime,
         anchor: CommittedTranscriptAnchor,
         source_bytes: []const u8,
+        source_sticky_rows: u16,
         target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
         scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
         destructive_invalidation: bool,
@@ -7876,8 +7885,10 @@ pub const TranscriptRuntime = struct {
             .committed_layout_id = anchor.layout_id,
             .committed_flow = anchor.flow,
             .committed_occupied_last_row = anchor.occupied_last_row,
+            .committed_sticky_rows = anchor.sticky_rows,
             .source_layout = self.committed_frame_layout,
             .source_bytes = source_bytes,
+            .source_sticky_rows = source_sticky_rows,
             .target_layout = target_layout,
             .scroll_plan = scroll_plan,
             .destructive_invalidation = destructive_invalidation,
@@ -7987,6 +7998,7 @@ pub const TranscriptRuntime = struct {
                     if (self.stableRetainedTransitionBody(
                         anchor,
                         source_bytes,
+                        prepared.sticky_rows,
                         target_layout,
                         scroll_plan,
                         destructive_invalidation,
@@ -8111,30 +8123,18 @@ pub const TranscriptRuntime = struct {
                     target.visual_offset =
                         scroll_facts.source_visual_offset +
                         accepted_semantic_progress_rows;
-                    if (accepted_semantic_progress_rows <
-                        scroll_facts.semantic_progress_rows)
-                    {
-                        try target.stagePreparedProjection(
-                            alloc,
-                            self.layout,
-                            prepared,
-                            projection_area,
-                            target.visual_offset,
-                        );
-                    } else {
-                        const projection_layout = try layoutForTranscriptProjection(
-                            self.layout,
-                            projection_area,
-                        );
-                        try transcript_painter.reprojectPreparedTranscriptForVisualOffset(
-                            alloc,
-                            projection_layout,
-                            prepared,
-                            projection_area,
-                            target.visual_offset,
-                        );
-                        target.usePreparedProjection(prepared);
-                    }
+                    // Always stage through stagePreparedProjection. Bare
+                    // reproject requires remaining_visual_rows <= area.height()
+                    // and is EOF-only; mid-document recovering + sticky-shrunk
+                    // areas hit InvalidTranscriptTransition when content still
+                    // exceeds the scrolling viewport.
+                    try target.stagePreparedProjection(
+                        alloc,
+                        self.layout,
+                        prepared,
+                        projection_area,
+                        target.visual_offset,
+                    );
                 }
             },
             .invalid => if (semanticProgressNeedsStaging(
@@ -8556,7 +8556,7 @@ pub const TranscriptRuntime = struct {
             source,
             prepared,
             target_layout,
-            target_layout.transcript_area,
+            target_layout.transcript_area.afterTopInset(prepared.sticky_rows),
             scroll_plan,
             scroll_facts,
             destructive_invalidation,
@@ -8577,11 +8577,27 @@ pub const TranscriptRuntime = struct {
         activity_overlay_active: bool,
     ) !ResolvedTranscriptTarget {
         const target_area = target_layout.transcript_area;
+        const expected_top = if (target_area.isEmpty())
+            @as(u16, 0)
+        else
+            target_area.afterTopInset(prepared.sticky_rows).top;
         if (target_area.isEmpty() != projection_area.isEmpty() or
             (!target_area.isEmpty() and
-                (projection_area.top != target_area.top or
+                (projection_area.top != expected_top or
                     projection_area.bottom > target_area.bottom)))
         {
+            debug_trace.logf(
+                "scroll",
+                "transcript_transition_area_mismatch site=resolve_in_area sticky_rows={d} target={d}..{d} projection={d}..{d} expected_top={d}",
+                .{
+                    prepared.sticky_rows,
+                    target_area.top,
+                    target_area.bottom,
+                    projection_area.top,
+                    projection_area.bottom,
+                    expected_top,
+                },
+            );
             return error.InvalidTranscriptTransition;
         }
         try scroll_plan.validate(self.layout.rows);
@@ -8714,6 +8730,15 @@ pub const TranscriptRuntime = struct {
             !std.meta.eql(plan.viewport, resolved.target.selection) or
             (plan.activity == .overlay_entry) != resolved.activity_overlay_active)
         {
+            debug_trace.logf(
+                "scroll",
+                "transcript_transition_seal_mismatch site=seal_plan sticky_rows={d} plan_viewport_top={d} target_selection_top={d}",
+                .{
+                    prepared.sticky_rows,
+                    plan.viewport.top_row,
+                    resolved.target.selection.top_row,
+                },
+            );
             return error.InvalidTranscriptTransition;
         }
         const destructive_invalidation = render_engine.frame_retention.transcriptAreaHasDestructiveInvalidation(
@@ -8730,6 +8755,19 @@ pub const TranscriptRuntime = struct {
                 prepared.cursor.cursor_row != resolved.target.cursor_row or
                 prepared.cursor.cursor_col != resolved.target.cursor_col)
             {
+                debug_trace.logf(
+                    "scroll",
+                    "transcript_transition_seal_mismatch site=seal_paint sticky_rows={d} prepared_top={d} target_top={d} prepared_cursor={d},{d} target_cursor={d},{d}",
+                    .{
+                        prepared.sticky_rows,
+                        prepared.selection.top_row,
+                        resolved.target.selection.top_row,
+                        prepared.cursor.cursor_row,
+                        prepared.cursor.cursor_col,
+                        resolved.target.cursor_row,
+                        resolved.target.cursor_col,
+                    },
+                );
                 return error.InvalidTranscriptTransition;
             },
             .retain_committed => |retained| {
@@ -9115,6 +9153,7 @@ pub const TranscriptRuntime = struct {
             .trace_visible_rows = prepared.trace_visible_rows,
             .measured_history_origin = target.measured_history_origin,
             .row_provenance = row_provenance,
+            .sticky_rows = target.sticky_rows,
             .normal_buffer_recovery_pending = target.normal_buffer_recovery_pending,
             .history_catchup_pending = target.history_catchup_pending,
         };
@@ -9312,6 +9351,7 @@ pub const TranscriptRuntime = struct {
                 .row_provenance = transition.row_provenance,
                 .normal_buffer_recovery_pending = transition.normal_buffer_recovery_pending,
                 .history_catchup_pending = transition.history_catchup_pending,
+                .sticky_rows = transition.sticky_rows,
             } };
             transition.row_provenance = &.{};
             transition.retention_identity = .{};
@@ -12310,6 +12350,96 @@ test "pending tail projection seals against the complete frame layout" {
         candidate.transcript_area.bottom,
         transition.target_layout.transcript_area.bottom,
     );
+}
+
+test "sticky inset projection area is required for transition resolve" {
+    const alloc = std.testing.allocator;
+    const layout = invalidationTestLayout();
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    var flow: std.ArrayList(u8) = .empty;
+    defer flow.deinit(alloc);
+    for (0..40) |_| try flow.appendSlice(alloc, "row\n");
+    var source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, flow.items),
+    );
+    defer source.deinit(alloc);
+
+    const candidate = render_engine.frame_layout.solve(.{
+        .terminal = layout,
+        .owned_top = runtime.owned_top_row,
+        .footer = .{
+            .natural_rows = 3,
+            .min_rows = 3,
+            .max_rows = 3,
+        },
+        .transcript = source.preview,
+        .prior = runtime.committed_frame_layout,
+    });
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        &source,
+        candidate.transcript_area,
+    );
+    defer prepared.deinit(alloc);
+    // Simulate sticky T0 umbrella owning the top transcript row.
+    prepared.sticky_rows = 1;
+    prepared.sticky_top_row = candidate.transcript_area.top;
+    prepared.selection.top_row = candidate.transcript_area.top + 1;
+    prepared.projection_area = candidate.transcript_area.afterTopInset(1);
+
+    const facts = try runtime.prepareTranscriptScrollFactsForFrame(
+        alloc,
+        &source,
+        &prepared,
+        false,
+        false,
+    );
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    const target_layout = render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(candidate);
+
+    // Full-band top (pre-fix caller shape) must be rejected when sticky is active.
+    try std.testing.expectError(
+        error.InvalidTranscriptTransition,
+        runtime.resolveTranscriptTransitionTargetForFrameInArea(
+            alloc,
+            &source,
+            &prepared,
+            target_layout,
+            candidate.transcript_area,
+            scroll_plan,
+            facts,
+            false,
+            false,
+        ),
+    );
+
+    const sticky_area = candidate.transcript_area.afterTopInset(prepared.sticky_rows);
+    const resolved = try runtime.resolveTranscriptTransitionTargetForFrameInArea(
+        alloc,
+        &source,
+        &prepared,
+        target_layout,
+        sticky_area,
+        scroll_plan,
+        facts,
+        false,
+        false,
+    );
+    try std.testing.expectEqual(sticky_area.top, resolved.selection().top_row);
 }
 
 test "history recovery preserves retained geometry and stages painted frames" {

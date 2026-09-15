@@ -2145,15 +2145,19 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 self.presentation_shell.committed_frame_layout.transcript_area,
                 candidate_plan.invalidation,
             );
+            const canonical_area = transcriptAreaBeforePendingTail(
+                candidate.transcript_area,
+                self.pending_tail_rows,
+            );
+            // Sticky umbrella owns the top inset; scrolling projection/staging
+            // must use the same shrunk area prepare already applied.
+            const projection_area = canonical_area.afterTopInset(prepared.sticky_rows);
             const target = try self.presentation_shell.resolveTranscriptTransitionTargetForFrameInArea(
                 self.app.alloc,
                 source,
                 prepared,
                 render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(candidate),
-                transcriptAreaBeforePendingTail(
-                    candidate.transcript_area,
-                    self.pending_tail_rows,
-                ),
+                projection_area,
                 scroll_plan,
                 scroll_facts,
                 destructive_invalidation,
