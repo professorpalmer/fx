@@ -1515,12 +1515,16 @@ fn projectTieredTurn(
     };
     // Sticky chrome: always T0 header; when T0 expanded, also keep compact T1
     // headers so the umbrella stays visible while details/prose scroll in body.
-    const sticky_for_turn = if (collapse.active_turn_key) |active|
-        active == turn_key
-    else if (collapse.tree) |tree|
-        if (tree.preferred_turn_key) |pref| pref == turn_key else false
-    else
-        false;
+    // Pin chrome to sticky for the live/preferred umbrella turn. Live tail
+    // umbrella before preferred is seeded must also split — otherwise T0/T1
+    // stay in the scrolling body and leave gutter crumbs under sticky paint.
+    const sticky_for_turn = blk: {
+        if (collapse.active_turn_key) |active| break :blk active == turn_key;
+        if (collapse.tree) |tree| {
+            if (tree.preferred_turn_key) |pref| break :blk pref == turn_key;
+        }
+        break :blk is_tail_span and use_umbrella;
+    };
     var body_bytes = bytes;
     var body_lines = owned_lines;
     if (sticky_for_turn) {
@@ -3000,9 +3004,16 @@ test "live tail tools under collapse tree umbrella before preferred catches up" 
         .{},
     );
     defer projection.deinit(alloc);
+    // Live-tail umbrella pins T0 into sticky even before preferred is seeded.
+    const sticky = projection.sticky_chrome orelse "";
     const body = projection.entry_actions.items[0].override.bytes;
-    try std.testing.expect(std.mem.find(u8, body, "Tool activity") != null);
-    try std.testing.expect(std.mem.find(u8, body, "▼ ") != null or std.mem.find(u8, body, "▶ ") != null);
+    const combined = try std.mem.concat(alloc, u8, &.{ sticky, "\n", body });
+    defer alloc.free(combined);
+    try std.testing.expect(std.mem.find(u8, combined, "Tool activity") != null);
+    try std.testing.expect(std.mem.find(u8, sticky, "Tool activity") != null);
+    try std.testing.expect(std.mem.find(u8, sticky, "▼ ") != null or std.mem.find(u8, sticky, "▶ ") != null);
+    try std.testing.expect(std.mem.find(u8, body, "▼ ") == null);
+    try std.testing.expect(std.mem.find(u8, body, "▶ ") == null);
 }
 
 test "historical tool-only turn without preferred match stays legacy grouped" {

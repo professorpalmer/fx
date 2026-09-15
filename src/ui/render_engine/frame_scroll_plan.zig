@@ -114,18 +114,22 @@ pub const FrameScrollPlan = struct {
     terminal_scroll_rows: u16,
     remaining_inline_advance_rows: u32,
     post_scroll_owned_top: u16,
+    /// First row of DECSTBM scrolling region (1 = full terminal). Sticky
+    /// umbrella chrome occupies rows above this and must not enter scrollback.
+    scroll_region_top: u16 = 1,
 
     pub fn none(terminal_rows: u16, current_owned_top: u16) FrameScrollPlan {
         return merge(terminal_rows, current_owned_top, 0, 0);
     }
 
     pub fn validate(self: FrameScrollPlan, terminal_rows: u16) !void {
-        const expected = merge(
+        var expected = merge(
             terminal_rows,
             self.prior_owned_top,
             self.requested_release_rows,
             self.requested_inline_advance_rows,
         );
+        expected.scroll_region_top = self.scroll_region_top;
         if (!std.meta.eql(self, expected)) return error.InvalidFrameScrollPlan;
     }
 

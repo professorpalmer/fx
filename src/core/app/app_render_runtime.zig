@@ -1683,6 +1683,16 @@ pub fn Runtime(comptime App: type) type {
                 presentation_shell,
                 active_committed_layout,
             );
+            // Keep sticky T0(+T1) outside the terminal scroll region so newline
+            // release cannot spill umbrella chrome into scrollback gutters.
+            if (prepared_transcript) |*prepared| {
+                if (prepared.sticky_rows > 0) {
+                    scroll_plan.scroll_region_top = prepared.sticky_top_row + prepared.sticky_rows;
+                    if (transcript_transition) |*transition| {
+                        transition.scroll_plan.scroll_region_top = scroll_plan.scroll_region_top;
+                    }
+                }
+            }
             const result = try render_engine.frame_builder.buildAndFlushFrame(
                 app.alloc,
                 &frame_shell,

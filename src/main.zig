@@ -4373,6 +4373,7 @@ test {
     _ = @import("ui/full_transcript_screen.zig");
     _ = @import("ui/render_engine/frame_fixed_point.zig");
     _ = @import("ui/render_engine/terminal_diff.zig");
+    _ = @import("ui/render_engine/frame_retention.zig");
     _ = @import("ui/transcript/runtime.zig");
     _ = @import("ui/transcript/runtime_tests.zig");
     _ = @import("ui/transcript/tool_collapse_state.zig");
