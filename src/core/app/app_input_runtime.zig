@@ -983,6 +983,15 @@ pub fn Runtime(comptime App: type) type {
 
             if (try full_transcript_rt.routeAction(app, resolved)) return .done;
 
+            if (resolved == .collapse_tools_step) {
+                _ = try routeTieredCollapseHotkey(app, true);
+                return .done;
+            }
+            if (resolved == .expand_tools_step) {
+                _ = try routeTieredCollapseHotkey(app, false);
+                return .done;
+            }
+
             if (resolved == .paste_start) {
                 if (comptime runtime_profile.allows(App, .native_auth) and
                     @hasDecl(@TypeOf(app.auth), "signInCodeEntryActive"))
@@ -1099,6 +1108,8 @@ pub fn Runtime(comptime App: type) type {
                 .insert_newline,
                 .composer_shortcut,
                 .toggle_full_transcript,
+                .collapse_tools_step,
+                .expand_tools_step,
                 => unreachable,
                 .page_up,
                 .page_down,
@@ -1545,7 +1556,6 @@ pub fn Runtime(comptime App: type) type {
                         return;
                     }
                     if (byte >= 32 and byte != 127) {
-                        if (try routeTieredCollapseHotkey(app, byte)) return;
                         const insertion_start = if (app.input_runtime.edit_state.selectionRange()) |selection|
                             selection.start
                         else
@@ -1581,14 +1591,14 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// Marionette-style mid-run collapse hotkeys. Composer must be empty so
-        /// drafting `[` / `]` is undisturbed. Only `[` / `]` change collapse level
-        /// (Space/Enter are not collapse keys). Updates apply synchronously onto
-        /// `tool_collapse` even while `stream.active` so the next paint reflects
-        /// the new level without waiting for a worker turn break.
-        fn routeTieredCollapseHotkey(app: *App, byte: u8) !bool {
+        /// Marionette-style mid-run collapse hotkeys. Bound to non-printable
+        /// Ctrl+[ / Ctrl+] (Kitty / modifyOtherKeys) plus legacy Ctrl+\\ / Ctrl+].
+        /// Bare `[` / `]` type into the composer. Space/Enter are not collapse keys.
+        /// Updates apply synchronously onto `tool_collapse` even while
+        /// `stream.active` so the next paint reflects the new level without
+        /// waiting for a worker turn break.
+        fn routeTieredCollapseHotkey(app: *App, collapse: bool) !bool {
             if (comptime !@hasField(@TypeOf(app.shell), "tool_collapse")) return false;
-            if (byte != '[' and byte != ']') return false;
             if (app.input_runtime.edit_state.input.items.len != 0) return false;
             if (modelMenuActive(app) or helpMenuActive(app) or commandSkillsMenuActive(app)) return false;
             const defaults = tool_collapse_state.CollapseDefaults.fromCollapseToolCalls(
@@ -1601,21 +1611,14 @@ pub fn Runtime(comptime App: type) type {
                 tool_collapse_state.newestTurnKeyFromToolDetails(app.shell.tool_details.items) orelse
                 return false;
             app.shell.tool_collapse.ensurePreferredTurn(turn_key);
-            switch (byte) {
-                '[' => {
-                    try app.shell.tool_collapse.stepCollapse(app.alloc, turn_key, defaults);
-                    app.shell.tool_collapse.markPreserveViewport();
-                    app.shell.render_requests.request(.transcript);
-                    return true;
-                },
-                ']' => {
-                    try app.shell.tool_collapse.stepExpand(app.alloc, turn_key, defaults);
-                    app.shell.tool_collapse.markPreserveViewport();
-                    app.shell.render_requests.request(.transcript);
-                    return true;
-                },
-                else => return false,
+            if (collapse) {
+                try app.shell.tool_collapse.stepCollapse(app.alloc, turn_key, defaults);
+            } else {
+                try app.shell.tool_collapse.stepExpand(app.alloc, turn_key, defaults);
             }
+            app.shell.tool_collapse.markPreserveViewport();
+            app.shell.render_requests.request(.transcript);
+            return true;
         }
 
         /// While the picker borrows the composer, destructive global gestures

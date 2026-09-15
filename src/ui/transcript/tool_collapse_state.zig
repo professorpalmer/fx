@@ -2,7 +2,7 @@ const std = @import("std");
 const types = @import("../../core/shared/types.zig");
 
 /// Three visually distinct collapse levels for Marionette-style hotkeys.
-/// `[` / `]` step between these; they must not collapse to a binary open/close.
+/// Ctrl+[ / Ctrl+] step between these; they must not collapse to a binary open/close.
 pub const Level = enum {
     /// T0 umbrella only (`▶ Tool activity · N`).
     t0_only,
@@ -107,7 +107,7 @@ pub const ToolCollapseTree = struct {
         }
     }
 
-    /// `]` — step toward fuller detail.
+    /// Ctrl+] — step toward fuller detail.
     pub fn stepExpand(self: *ToolCollapseTree, alloc: std.mem.Allocator, turn_key: u64, defaults: CollapseDefaults) !void {
         const next: Level = switch (self.levelForTurn(turn_key, defaults)) {
             .t0_only => .t1_headers,
@@ -117,7 +117,7 @@ pub const ToolCollapseTree = struct {
         try self.applyLevel(alloc, turn_key, next);
     }
 
-    /// `[` — step toward fuller collapse.
+    /// Ctrl+[ — step toward fuller collapse.
     pub fn stepCollapse(self: *ToolCollapseTree, alloc: std.mem.Allocator, turn_key: u64, defaults: CollapseDefaults) !void {
         const next: Level = switch (self.levelForTurn(turn_key, defaults)) {
             .t1_details => .t1_headers,
@@ -127,7 +127,7 @@ pub const ToolCollapseTree = struct {
         try self.applyLevel(alloc, turn_key, next);
     }
 
-    /// `[` — collapse preferred turn to T0 umbrella only.
+    /// Ctrl+[ — collapse preferred turn to T0 umbrella only.
     pub fn collapseAllToT0(self: *ToolCollapseTree, alloc: std.mem.Allocator) !void {
         if (self.preferred_turn_key) |turn_key| {
             try self.applyLevel(alloc, turn_key, .t0_only);
@@ -141,7 +141,7 @@ pub const ToolCollapseTree = struct {
         self.t1_force_expanded = false;
     }
 
-    /// `]` — expand T0; keep T1 at headers only.
+    /// Ctrl+] — expand T0; keep T1 at headers only.
     pub fn expandT0KeepT1Collapsed(self: *ToolCollapseTree, alloc: std.mem.Allocator, turn_key: u64) !void {
         try self.applyLevel(alloc, turn_key, .t1_headers);
     }
