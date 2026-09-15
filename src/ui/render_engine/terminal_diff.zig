@@ -383,6 +383,7 @@ pub fn flushFrame(input: FrameCommitInput) !FrameCommitResult {
             input.terminal_transition,
             reset,
             input.scroll_plan.scroll_region_top,
+            input.scroll_plan.sticky_top_row,
         );
         break :blk &local_movement.?;
     };
@@ -1042,7 +1043,8 @@ test "normal-screen transition precedes document movement in the prepared shadow
         0,
         transition,
         .none,
-        1);
+        1,
+        0);
     defer movement.deinit(std.testing.allocator);
 
     const restore = ui_terminal.alternateScreenFrameRestoreSequence(true);
@@ -1067,7 +1069,7 @@ test "normal-screen transition precedes document movement in the prepared shadow
 fn feedCanonicalScroll(shadow: *vt_emulator.Grid, target_rows: u16, accepted_scroll_rows: u16) !void {
     var scroll: std.Io.Writer.Allocating = .init(shadow.alloc);
     defer scroll.deinit();
-    try writeTerminalScroll(&scroll.writer, accepted_scroll_rows, target_rows, 1);
+    try writeTerminalScroll(&scroll.writer, accepted_scroll_rows, target_rows);
     try shadow.feed(scroll.written());
 }
 
@@ -1166,22 +1168,14 @@ fn writeBandClears(out: *std.Io.Writer, top: u16, bottom: u16) !void {
     }
 }
 
-fn writeTerminalScroll(out: *std.Io.Writer, scroll_rows: u16, bottom_row: u16, scroll_region_top: u16) !void {
+fn writeTerminalScroll(out: *std.Io.Writer, scroll_rows: u16, bottom_row: u16) !void {
     if (scroll_rows == 0 or bottom_row == 0) return;
-    // Sticky umbrella owns [1, scroll_region_top). Scroll only the body region so
-    // T0/T1 chrome is not released into scrollback as gutter ghosts.
-    const region_top: u16 = if (scroll_region_top <= 1) 1 else @min(scroll_region_top, bottom_row);
-    const protect_sticky = region_top > 1;
-    if (protect_sticky) {
-        try out.print("\x1b[{d};{d}r", .{ region_top, bottom_row });
-    }
+    // Full-terminal newlines so released body rows enter native scrollback lookback.
+    // Sticky chrome must be DL-evicted before this when active (see prepareTerminalMovementForFrame).
     try out.print("\x1b[{d};1H", .{bottom_row});
     var row: u16 = 0;
     while (row < scroll_rows) : (row += 1) {
         try out.writeByte('\n');
-    }
-    if (protect_sticky) {
-        try out.writeAll("\x1b[r");
     }
 }
 
@@ -1224,6 +1218,7 @@ pub fn prepareTerminalMovement(
         .none,
         if (document_append.reset_replay) .clear else .none,
         1,
+        0,
     );
 }
 
@@ -1238,9 +1233,11 @@ pub fn prepareTerminalMovementForFrame(
     alignment_clear_start_row: u16,
     terminal_transition: FrameTerminalTransition,
     reset: FrameReset,
-    // First scrolling row (1 = full terminal). Sticky umbrella occupies rows
-    // above this and must not be released into scrollback.
+    // First body row after sticky (1 = no sticky). Paired with sticky_top_row.
     scroll_region_top: u16,
+    // Absolute sticky chrome top (0 = none). When set with planned scroll,
+    // sticky rows are DL-evicted before full-terminal newline release.
+    sticky_top_row: u16,
 ) !PreparedTerminalMovement {
     if (document_append.reset_replay and (planned_scroll_rows != 0 or reset == .none)) {
         return error.InvalidFrameScrollPlan;
@@ -1258,12 +1255,28 @@ pub fn prepareTerminalMovementForFrame(
     );
     const sync_prefix_offset = try appendFrameReset(&bytes, &post_movement, reset);
 
-    const region_top: u16 = if (scroll_region_top <= 1) 1 else @min(scroll_region_top, target_rows);
-    const protect_sticky = region_top > 1;
-    if (protect_sticky) {
-        const region_start = bytes.written().len;
-        try bytes.writer.print("\x1b[{d};{d}r", .{ region_top, target_rows });
-        _ = try feedMovementSegment(&bytes, &post_movement, region_start);
+    // Partial DECSTBM discards lines instead of pushing them to scrollback —
+    // that killed lookback. Instead: delete sticky rows (no scrollback), then
+    // full-terminal newline release so transcript body enters native lookback.
+    // Paint restores sticky on the post-movement grid.
+    const sticky_rows: u16 = blk: {
+        if (sticky_top_row == 0 or scroll_region_top <= sticky_top_row) break :blk 0;
+        break :blk scroll_region_top - sticky_top_row;
+    };
+    // Only evict when sticky overlaps the rows a full-terminal scroll would
+    // push into scrollback (rows 1..planned_scroll_rows). When sticky sits below
+    // that band (owned_top > release), leave it alone.
+    const sticky_would_enter_scrollback =
+        sticky_rows > 0 and
+        planned_scroll_rows > 0 and
+        sticky_top_row > 0 and
+        sticky_top_row <= planned_scroll_rows and
+        sticky_top_row <= target_rows;
+    if (sticky_would_enter_scrollback) {
+        const evict_start = bytes.written().len;
+        try bytes.writer.print("\x1b[{d};1H\x1b[{d}M", .{ sticky_top_row, sticky_rows });
+        // Feed without FeedStats so DL is not counted as planned release scroll.
+        try post_movement.feed(bytes.written()[evict_start..]);
     }
 
     const document_movement = try appendDocumentMovement(
@@ -1308,12 +1321,6 @@ pub fn prepareTerminalMovementForFrame(
         target_rows,
         if (document_movement.segment.hasBytes()) 0 else alignment_clear_start_row,
     );
-
-    if (protect_sticky) {
-        const reset_start = bytes.written().len;
-        try bytes.writer.writeAll("\x1b[r");
-        _ = try feedMovementSegment(&bytes, &post_movement, reset_start);
-    }
 
     return .{
         .bytes = try bytes.toOwnedSlice(),
@@ -1466,7 +1473,7 @@ fn appendAlignmentScroll(
         if (clear_start_row > target_rows) return error.InvalidFrameScrollPlan;
         try writeBandClears(&bytes.writer, clear_start_row, target_rows);
     }
-    try writeTerminalScroll(&bytes.writer, alignment_scroll_rows, target_rows, 1);
+    try writeTerminalScroll(&bytes.writer, alignment_scroll_rows, target_rows);
     const alignment_segment = try feedMovementSegment(bytes, post_movement, alignment_start);
     if (!alignment_segment.hasBytes()) return alignment_segment;
 
@@ -1880,7 +1887,8 @@ test "normal-screen restore and inline repaint commit in one sink write" {
             0,
             transition,
             .none,
-            1);
+            1,
+            0);
         defer movement.deinit(std.testing.allocator);
 
         var plan = testPlan();
@@ -1953,7 +1961,8 @@ test "normal-screen restore preserves saved modes through reset replay" {
         0,
         transition,
         .clear,
-        1);
+        1,
+        0);
     defer movement.deinit(std.testing.allocator);
 
     try std.testing.expect(!movement.post_movement.autowrap);
@@ -2018,7 +2027,8 @@ test "normal-screen restore partial write retries to the committed frame" {
         0,
         transition,
         .none,
-        1);
+        1,
+        0);
     defer uninterrupted_movement.deinit(std.testing.allocator);
     var uninterrupted_sink = TestSink{};
     defer uninterrupted_sink.deinit(std.testing.allocator);
@@ -2053,7 +2063,8 @@ test "normal-screen restore partial write retries to the committed frame" {
         0,
         transition,
         .none,
-        1);
+        1,
+        0);
     defer movement.deinit(std.testing.allocator);
     const cut = "\x1b[?2026h".len + "\x1b[?25l".len +
         ui_terminal.alternateScreenFrameRestoreSequence(true).len + 3;
@@ -2085,7 +2096,8 @@ test "normal-screen restore partial write retries to the committed frame" {
         0,
         transition,
         .none,
-        1);
+        1,
+        0);
     defer retry_movement.deinit(std.testing.allocator);
     var retry_sink = TestSink{};
     defer retry_sink.deinit(std.testing.allocator);
@@ -2138,7 +2150,8 @@ test "normal-screen reset replay recovers interrupted controls and accepted docu
             0,
             transition,
             reset,
-            1);
+            1,
+            0);
         defer movement.deinit(alloc);
         var sink = TestSink{};
         defer sink.deinit(alloc);
@@ -2219,7 +2232,8 @@ test "normal-screen reset replay recovers interrupted controls and accepted docu
                 0,
                 transition,
                 reset,
-                1);
+                1,
+                0);
             defer retry_movement.deinit(alloc);
             var retry_sink = TestSink{};
             defer retry_sink.deinit(alloc);
@@ -3108,7 +3122,8 @@ test "flushFrame retries resize external clear and reset to uninterrupted state"
             0,
             .none,
             FrameReset.fromPlan(plan.reset_terminal, false),
-            1);
+            1,
+            0);
         defer uninterrupted_movement.deinit(std.testing.allocator);
         var uninterrupted_sink = TestSink{};
         defer uninterrupted_sink.deinit(std.testing.allocator);
@@ -3142,7 +3157,8 @@ test "flushFrame retries resize external clear and reset to uninterrupted state"
             0,
             .none,
             FrameReset.fromPlan(plan.reset_terminal, false),
-            1);
+            1,
+            0);
         defer movement.deinit(std.testing.allocator);
         var failing_sink = TestSink{ .fail_after_prefix = 3 };
         defer failing_sink.deinit(std.testing.allocator);
@@ -3172,7 +3188,8 @@ test "flushFrame retries resize external clear and reset to uninterrupted state"
             0,
             .none,
             FrameReset.fromPlan(retry_plan.reset_terminal, false),
-            1);
+            1,
+            0);
         defer retry_movement.deinit(std.testing.allocator);
         var retry_sink = TestSink{};
         defer retry_sink.deinit(std.testing.allocator);
@@ -4421,7 +4438,7 @@ test "flushFrame accepted scroll repair preserves DECAWM off after successful co
 }
 
 
-test "sticky scroll region excludes umbrella rows from terminal scroll" {
+test "sticky DL eviction precedes full-terminal scroll release" {
     const alloc = std.testing.allocator;
     var previous = try vt_emulator.Grid.init(alloc, 8, 6);
     defer previous.deinit();
@@ -4439,14 +4456,49 @@ test "sticky scroll region excludes umbrella rows from terminal scroll" {
         .none,
         .none,
         2,
+        1,
     );
     defer movement.deinit(alloc);
 
-    try std.testing.expect(std.mem.find(u8, movement.bytes, "\x1b[2;6r") != null);
-    try std.testing.expect(std.mem.find(u8, movement.bytes, "\x1b[r") != null);
-    // Sticky row must remain "sticky" after body-region scroll.
+    // DL-evict sticky before full-terminal newline release (no DECSTBM clamp).
+    try std.testing.expect(std.mem.find(u8, movement.bytes, "\x1b[1;1H\x1b[1M") != null);
+    try std.testing.expect(std.mem.find(u8, movement.bytes, "\x1b[2;6r") == null);
+    // After eviction + 1-row release, body-a left the viewport; body-b is at row 1.
+    // Paint restores sticky; movement itself must not leave chrome in scroll-release rows.
     var row: std.ArrayList(u8) = .empty;
     defer row.deinit(alloc);
     try movement.post_movement.rowTextTrimmed(1, &row);
-    try std.testing.expectEqualStrings("sticky", row.items);
+    try std.testing.expectEqualStrings("body-b", row.items);
+}
+
+test "sticky eviction keeps full-terminal scroll for lookback" {
+    const alloc = std.testing.allocator;
+    var previous = try vt_emulator.Grid.init(alloc, 8, 6);
+    defer previous.deinit();
+    try previous.feed("\x1b[1;1Hsticky\x1b[2;1Hbody-a\x1b[3;1Hbody-b\x1b[4;1Hbody-c");
+
+    var movement = try prepareTerminalMovementForFrame(
+        alloc,
+        &previous,
+        .{},
+        2,
+        2,
+        8,
+        6,
+        0,
+        .none,
+        .none,
+        2,
+        1,
+    );
+    defer movement.deinit(alloc);
+
+    // Full-terminal newlines (lookback), not a partial DECSTBM region.
+    try std.testing.expect(std.mem.find(u8, movement.bytes, "\x1b[r") == null);
+    try std.testing.expect(std.mem.find(u8, movement.bytes, "\x1b[2;6r") == null);
+    try std.testing.expect(std.mem.find(u8, movement.bytes, "\x1b[1;1H\x1b[1M") != null);
+    // Two newlines after eviction release body-a and body-b into scrollback path.
+    const dl = std.mem.find(u8, movement.bytes, "\x1b[1;1H\x1b[1M") orelse return error.TestExpectedStickyEvict;
+    const tail = movement.bytes[dl..];
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, tail, "\n"));
 }

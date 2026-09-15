@@ -1683,12 +1683,15 @@ pub fn Runtime(comptime App: type) type {
                 presentation_shell,
                 active_committed_layout,
             );
-            // Keep sticky T0(+T1) outside the terminal scroll region so newline
-            // release cannot spill umbrella chrome into scrollback gutters.
+            // Evict sticky T0(+T1) via DL before full-terminal newline release so
+            // umbrella chrome does not spill into scrollback, while body rows still
+            // enter native lookback (partial DECSTBM would discard history).
             if (prepared_transcript) |*prepared| {
-                if (prepared.sticky_rows > 0) {
+                if (prepared.sticky_rows > 0 and prepared.sticky_top_row > 0) {
+                    scroll_plan.sticky_top_row = prepared.sticky_top_row;
                     scroll_plan.scroll_region_top = prepared.sticky_top_row + prepared.sticky_rows;
                     if (transcript_transition) |*transition| {
+                        transition.scroll_plan.sticky_top_row = scroll_plan.sticky_top_row;
                         transition.scroll_plan.scroll_region_top = scroll_plan.scroll_region_top;
                     }
                 }

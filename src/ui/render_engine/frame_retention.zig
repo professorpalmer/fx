@@ -45,9 +45,10 @@ fn candidateHasStableSource(candidate: StableRetainCandidate) bool {
     // Sticky inset changes move body rows without changing body flow bytes —
     // refuse retain so vacated T1 chrome cannot ghost in the scrolling region.
     if (candidate.committed_sticky_rows != candidate.source_sticky_rows) return false;
-    // While sticky owns the top inset, always repaint. Retaining the full
-    // transcript band (or a scrolled post-movement grid) leaves T0/T1/drawer
-    // gutter crumbs in the body when sticky chrome and scroll interact.
+    // While sticky owns the top inset, always repaint the scrolling body so
+    // collapse hotkeys (Ctrl+[ / Ctrl+]) and sticky chrome updates cannot be
+    // skipped by retain. Lookback is preserved separately via DL eviction
+    // before full-terminal newline release (not by partial DECSTBM).
     if (candidate.source_sticky_rows > 0) return false;
     return std.mem.eql(u8, candidate.source_bytes, candidate.committed_flow);
 }
@@ -320,6 +321,8 @@ test "validate retains the primary transcript after a normal-screen transition" 
         0,
         .{ .restore_normal_screen = .{ .mouse_tracking_active = true } },
         .none,
+        1,
+        0,
     );
     defer movement.deinit(std.testing.allocator);
 
@@ -433,7 +436,7 @@ test "countSurfaceChanges treats identical combining suffixes as retained" {
     );
 }
 
-test "stable retain refuses any sticky inset to avoid gutter ghosts" {
+test "stable retain refuses any sticky inset so hotkey paints are not skipped" {
     const flow = "stable transcript\n";
     const source_layout: frame_layout.CommittedLayoutSnapshot = .{
         .layout_id = 9,

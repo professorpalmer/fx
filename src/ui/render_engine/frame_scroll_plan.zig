@@ -114,12 +114,21 @@ pub const FrameScrollPlan = struct {
     terminal_scroll_rows: u16,
     remaining_inline_advance_rows: u32,
     post_scroll_owned_top: u16,
-    /// First row of DECSTBM scrolling region (1 = full terminal). Sticky
-    /// umbrella chrome occupies rows above this and must not enter scrollback.
+    /// First body row after sticky chrome (1 = no sticky). Used to evict
+    /// sticky rows via DL before full-terminal newline release so umbrella
+    /// chrome does not enter scrollback, while body rows still do.
     scroll_region_top: u16 = 1,
+    /// Absolute top row of sticky chrome when active (0 = none). Paired with
+    /// scroll_region_top so eviction deletes only sticky rows, not lookback.
+    sticky_top_row: u16 = 0,
 
     pub fn none(terminal_rows: u16, current_owned_top: u16) FrameScrollPlan {
         return merge(terminal_rows, current_owned_top, 0, 0);
+    }
+
+    pub fn stickyRows(self: FrameScrollPlan) u16 {
+        if (self.sticky_top_row == 0 or self.scroll_region_top <= self.sticky_top_row) return 0;
+        return self.scroll_region_top - self.sticky_top_row;
     }
 
     pub fn validate(self: FrameScrollPlan, terminal_rows: u16) !void {
@@ -130,6 +139,7 @@ pub const FrameScrollPlan = struct {
             self.requested_inline_advance_rows,
         );
         expected.scroll_region_top = self.scroll_region_top;
+        expected.sticky_top_row = self.sticky_top_row;
         if (!std.meta.eql(self, expected)) return error.InvalidFrameScrollPlan;
     }
 
