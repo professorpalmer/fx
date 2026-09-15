@@ -1306,6 +1306,7 @@ fn projectTieredTurn(
     style: SummaryStyle,
     styles: transcript_blocks.Styles,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
+    is_tail_span: bool,
 ) !void {
     var tool_indices: std.ArrayList(usize) = .empty;
     defer tool_indices.deinit(alloc);
@@ -1327,13 +1328,21 @@ fn projectTieredTurn(
     }
     if (tool_indices.items.len == 0) return;
 
-    const turn_key = resolveTurnKeyForSpan(entries, details, detail_indices, span_start, span_end, collapse);
-    // Umbrella only with interleaved protected prose OR the live/preferred turn.
-    // A bare tree pointer must NOT force umbrella on historical turns (scroll-up dupes).
     const preferred = collapse.active_turn_key orelse
         (if (collapse.tree) |tree| tree.preferred_turn_key else null);
-    const use_umbrella = prose_indices.items.len > 0 or
-        (if (preferred) |pref| pref == turn_key else false);
+    var turn_key = resolveTurnKeyForSpan(entries, details, detail_indices, span_start, span_end, collapse);
+    // Umbrella when:
+    // - protected prose is interleaved (Marionette relocate), or
+    // - this span resolves to the live/preferred turn key, or
+    // - this is the live/tail Generating span under an active collapse tree
+    //   (tools before prose / before preferred catches up must not flash legacy chips).
+    // A bare tree pointer must NOT force umbrella on older non-tail spans.
+    const matches_preferred = if (preferred) |pref| pref == turn_key else false;
+    const use_umbrella = prose_indices.items.len > 0 or matches_preferred or
+        (is_tail_span and collapse.tree != null);
+    if (use_umbrella and is_tail_span) {
+        if (preferred) |pref| turn_key = pref;
+    }
     if (!use_umbrella) {
         try projectLegacyGroupsInSpan(
             alloc,
@@ -1633,6 +1642,7 @@ fn projectCompactTieredTurns(
         const at_boundary = index == entries.len or entries[index] == .user_turn;
         if (!at_boundary) continue;
         if (index > span_start) {
+            const is_tail_span = index == entries.len;
             try projectTieredTurn(
                 alloc,
                 projection,
@@ -1649,6 +1659,7 @@ fn projectCompactTieredTurns(
                 style,
                 styles,
                 checkpoint,
+                is_tail_span,
             );
         }
         span_start = index + 1;
@@ -2665,9 +2676,12 @@ test "umbrella prose provenance covers blank separator when T0 collapsed" {
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
     const override = projection.entry_actions.items[0].override;
-    try std.testing.expect(std.mem.find(u8, override.bytes, "Tool activity") != null);
+    const sticky = projection.sticky_chrome orelse "";
+    const painted = try std.mem.concat(alloc, u8, &.{ sticky, "\n", override.bytes });
+    defer alloc.free(painted);
+    try std.testing.expect(std.mem.find(u8, painted, "Tool activity") != null);
     try std.testing.expect(std.mem.find(u8, override.bytes, "protected prose") != null);
-    try std.testing.expect(std.mem.find(u8, override.bytes, "▶ ") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "▶ ") != null);
     try std.testing.expect(override.line_provenance.len >= hardLineCount(override.bytes));
 }
 
@@ -2731,7 +2745,10 @@ test "umbrella+prose mid-Generating shape survives compact render appendBlock" {
         },
     );
     defer prepared.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, prepared.bytes, "Tool activity") != null);
+    // Sticky owns T0 chrome when preferred is set; body/preparation keep prose + provenance.
+    const sticky = projection.sticky_chrome orelse "";
+    try std.testing.expect(std.mem.find(u8, sticky, "Tool activity") != null or
+        std.mem.find(u8, prepared.bytes, "Tool activity") != null);
     try std.testing.expect(std.mem.find(u8, prepared.bytes, "Working on it") != null);
     try std.testing.expect(prepared.line_provenance.len > 0);
 }
@@ -2909,6 +2926,153 @@ fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
     try std.testing.expect(std.mem.find(u8, alloc_block, "Running second") != null);
 }
 
+
+
+test "live preferred turn with tools and zero prose uses umbrella" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Running one", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Running two", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("run_command"),
+            .activity_kind = .command,
+            .outcome = .completed,
+            .lifecycle_id = .{ .turn_id = 7, .call_id = @constCast("a") },
+        },
+        .{
+            .entry_id = 2,
+            .tool_name = @constCast("read_file"),
+            .activity_kind = .read,
+            .outcome = .completed,
+            .lifecycle_id = .{ .turn_id = 7, .call_id = @constCast("b") },
+        },
+    };
+    var tree: tool_collapse_state.ToolCollapseTree = .{};
+    defer tree.deinit(alloc);
+    tree.ensurePreferredTurn(7);
+
+    var projection = try buildStyledFocused(
+        alloc,
+        &entries,
+        &details,
+        120,
+        null,
+        .{ .tree = &tree, .active_turn_key = 7, .collapse_tool_calls = true },
+        .{},
+        .{},
+    );
+    defer projection.deinit(alloc);
+
+    // Live Generating before prose: umbrella path (sticky and/or in-flow), not legacy chips only.
+    const sticky = projection.sticky_chrome orelse "";
+    const body = projection.entry_actions.items[0].override.bytes;
+    const combined = try std.mem.concat(alloc, u8, &.{ sticky, "\n", body });
+    defer alloc.free(combined);
+    try std.testing.expect(std.mem.find(u8, combined, "Tool activity") != null);
+    try std.testing.expect(std.mem.find(u8, combined, "▼ ") != null or std.mem.find(u8, combined, "▶ ") != null);
+}
+
+test "live tail tools under collapse tree umbrella before preferred catches up" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Running early", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Running batch", .class = .tool_status } },
+    };
+    // No lifecycle yet — early live tool batch before preferred is seeded.
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read },
+    };
+    var tree: tool_collapse_state.ToolCollapseTree = .{};
+    defer tree.deinit(alloc);
+    // Tree present, preferred still null (live Generating before ensurePreferredTurn).
+    var projection = try buildStyledFocused(
+        alloc,
+        &entries,
+        &details,
+        120,
+        null,
+        .{ .tree = &tree, .collapse_tool_calls = true },
+        .{},
+        .{},
+    );
+    defer projection.deinit(alloc);
+    const body = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, body, "Tool activity") != null);
+    try std.testing.expect(std.mem.find(u8, body, "▼ ") != null or std.mem.find(u8, body, "▶ ") != null);
+}
+
+test "historical tool-only turn without preferred match stays legacy grouped" {
+    const alloc = std.testing.allocator;
+    // Historical span before a later live turn. Preferred points at the live turn
+    // so this older tool-only span must stay legacy despite tree != null.
+    const user_text = try alloc.dupe(u8, "next prompt");
+    defer alloc.free(user_text);
+    var entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● old command", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● old read", .class = .tool_status } },
+        .{ .user_turn = .{ .id = 3, .turn = .{ .text = user_text, .images = &.{} } } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "● live tool", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("run_command"),
+            .activity_kind = .command,
+            .outcome = .completed,
+            .lifecycle_id = .{ .turn_id = 3, .call_id = @constCast("a") },
+        },
+        .{
+            .entry_id = 2,
+            .tool_name = @constCast("read_file"),
+            .activity_kind = .read,
+            .outcome = .completed,
+            .lifecycle_id = .{ .turn_id = 3, .call_id = @constCast("b") },
+        },
+        .{
+            .entry_id = 4,
+            .tool_name = @constCast("run_command"),
+            .activity_kind = .command,
+            .lifecycle_id = .{ .turn_id = 9, .call_id = @constCast("c") },
+        },
+    };
+    var tree: tool_collapse_state.ToolCollapseTree = .{};
+    defer tree.deinit(alloc);
+    tree.ensurePreferredTurn(9);
+
+    var projection = try buildStyledFocused(
+        alloc,
+        &entries,
+        &details,
+        120,
+        null,
+        .{ .tree = &tree, .active_turn_key = 9, .collapse_tool_calls = true },
+        .{},
+        .{},
+    );
+    defer projection.deinit(alloc);
+
+    // Historical span (before user_turn): legacy chips, no Tool activity umbrella.
+    try std.testing.expect(projection.entry_actions.items[0] == .override);
+    const historical = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, historical, "Tool activity") == null);
+    try std.testing.expect(std.mem.find(u8, historical, "tool call") != null);
+
+    // Live tail: umbrella path.
+    const sticky = projection.sticky_chrome orelse "";
+    try std.testing.expect(projection.entry_actions.items[3] == .override or sticky.len > 0);
+    const live_body = if (projection.entry_actions.items[3] == .override)
+        projection.entry_actions.items[3].override.bytes
+    else
+        "";
+    const combined = try std.mem.concat(alloc, u8, &.{ sticky, "\n", live_body });
+    defer alloc.free(combined);
+    try std.testing.expect(std.mem.find(u8, combined, "Tool activity") != null);
+}
+
 test "sticky chrome is stripped from in-flow body to avoid duplicate rows" {
     const alloc = std.testing.allocator;
     var entries = [_]TranscriptEntry{
@@ -3019,8 +3183,11 @@ test "stepExpand twice yields individual tool rows with box drawers" {
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     const block = projection.entry_actions.items[0].override.bytes;
-    try std.testing.expect(std.mem.find(u8, block, "▼ ") != null);
-    try std.testing.expect(std.mem.find(u8, block, "Tool activity") != null);
+    const sticky = projection.sticky_chrome orelse "";
+    const painted = try std.mem.concat(alloc, u8, &.{ sticky, "\n", block });
+    defer alloc.free(painted);
+    try std.testing.expect(std.mem.find(u8, painted, "▼ ") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "Tool activity") != null);
     // Level 3 must show stock-style child rows, not headers only.
     const has_drawer = std.mem.find(u8, block, "├") != null or std.mem.find(u8, block, "└") != null;
     try std.testing.expect(has_drawer);
