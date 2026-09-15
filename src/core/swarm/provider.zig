@@ -88,13 +88,16 @@ pub fn readJob(
     timeout_ms: u64,
 ) anyerror!?Read {
     // `status` and `feed` both require an id, so resolve the workspace's latest
-    // job first when the caller did not name one.
+    // job first when the caller did not name one. `--json` is required here:
+    // bare `last` prints only the id, which is not the object the parser reads.
     const resolved = if (job_id) |id|
         try alloc.dupe(u8, id)
     else blk: {
-        const latest = read_fn(alloc, &.{ commandName(), "last" }, timeout_ms) catch |err| return normalizeMissing(err);
+        const latest = read_fn(alloc, &.{ commandName(), "last", "--json" }, timeout_ms) catch |err| return normalizeMissing(err);
         defer alloc.free(latest);
-        // `last` answered but this workspace has no job yet: absence, not error.
+        // `last --json` answered without a job id, so there is nothing to show.
+        // A workspace with no Puppetmaster store exits non-zero instead, which
+        // reaches the caller as a failed read rather than as absence.
         break :blk (try parseLatestJobId(alloc, latest)) orelse return null;
     };
     defer alloc.free(resolved);
@@ -187,6 +190,10 @@ test "a job read resolves the latest id and pairs status with feed" {
             calls += 1;
             try std.testing.expectEqualStrings("puppetmaster", argv[0]);
             if (std.mem.eql(u8, argv[1], "last")) {
+                // `last` alone prints a bare id; only `last --json` prints the
+                // object this parser reads, so the flag is part of the contract.
+                try std.testing.expectEqual(@as(usize, 3), argv.len);
+                try std.testing.expectEqualStrings("--json", argv[2]);
                 return a.dupe(u8, "{\"job_id\":\"job_latest\"}");
             }
             if (std.mem.eql(u8, argv[1], "status")) {
@@ -229,6 +236,48 @@ test "an explicit job id skips the latest lookup" {
 
     // status plus feed, with no `last` probe.
     try std.testing.expectEqual(@as(usize, 2), Capture.calls);
+}
+
+test "the latest lookup asks for JSON, because bare last is not JSON" {
+    const alloc = std.testing.allocator;
+    const Capture = struct {
+        var saw_json_flag: bool = false;
+        var status_job: [64]u8 = undefined;
+        var status_job_len: usize = 0;
+
+        fn read(a: Allocator, argv: []const []const u8, _: u64) anyerror![]u8 {
+            if (std.mem.eql(u8, argv[1], "last")) {
+                saw_json_flag = argv.len == 3 and std.mem.eql(u8, argv[2], "--json");
+                // The real CLI answers `last` with a bare id and `last --json`
+                // with the object below.
+                return a.dupe(u8, if (saw_json_flag) "{\"job_id\":\"job_404d008539ef\"}" else "job_404d008539ef\n");
+            }
+            if (std.mem.eql(u8, argv[1], "status")) {
+                status_job_len = argv[2].len;
+                @memcpy(status_job[0..argv[2].len], argv[2]);
+                return a.dupe(u8, "{\"job\":{\"id\":\"job_404d008539ef\"}}");
+            }
+            return a.dupe(u8, "[]");
+        }
+    };
+    Capture.saw_json_flag = false;
+    Capture.status_job_len = 0;
+
+    var read = (try readJob(alloc, Capture.read, null, default_timeout_ms)).?;
+    defer read.deinit(alloc);
+
+    // A regression that drops the flag resolves no id, so this both fails the
+    // flag assertion and reports absence instead of a job.
+    try std.testing.expect(Capture.saw_json_flag);
+    try std.testing.expectEqualStrings("job_404d008539ef", Capture.status_job[0..Capture.status_job_len]);
+}
+
+test "a bare job id from last is not a job, so the flag is load-bearing" {
+    const alloc = std.testing.allocator;
+    // `puppetmaster last` prints `job_x` and nothing else; that is not the JSON
+    // object `parseLatestJobId` reads, which is why the read above passes --json.
+    try std.testing.expect(try parseLatestJobId(alloc, "job_404d008539ef\n") == null);
+    try std.testing.expect(try parseLatestJobId(alloc, "job_404d008539ef") == null);
 }
 
 test "a missing puppetmaster binary is reported as missing, not as an empty workspace" {
